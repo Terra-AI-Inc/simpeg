@@ -56,8 +56,9 @@ reporting = ["scooby"]
 plotting = ["plotly"]
 sklearn = ["scikit-learn>=1.2"]
 pandas = ["pandas"]
+umfpack = ["scikit-umfpack>=0.4"]
 all = [
-    "simpeg[dask,choclo,plotting,reporting,sklearn,pandas]"
+    "simpeg[dask,choclo,plotting,reporting,sklearn,pandas,umfpack]"
 ] # all optional *runtime* dependencies (not related to development)
 style = [
     "black==24.3.0",

@@ -12,6 +12,7 @@ from pymatsolver import (
 )
 from pymatsolver.solvers import Base
 from .code_utils import deprecate_function
+from ._umfpack_solver import SolverUMFPACK, is_available as _umfpack_available
 import warnings
 from typing import Type
 
@@ -23,6 +24,7 @@ __all__ = [
     "Diagonal",
     "Pardiso",
     "Mumps",
+    "SolverUMFPACK",
     "wrap_direct",
     "wrap_iterative",
     "get_default_solver",
@@ -35,11 +37,14 @@ __all__ = [
 # The default direct solver priority is:
 # Pardiso (optional, but available on intel systems)
 # Mumps (optional, but available for all systems)
+# UMFPACK (optional, available on all systems including ARM/Apple Silicon)
 # Scipy's SuperLU (available for all scipy systems)
 if AvailableSolvers["Pardiso"]:
     _DEFAULT_SOLVER = Pardiso
 elif AvailableSolvers["Mumps"]:
     _DEFAULT_SOLVER = Mumps
+elif _umfpack_available():
+    _DEFAULT_SOLVER = SolverUMFPACK
 else:
     _DEFAULT_SOLVER = SolverLU
 

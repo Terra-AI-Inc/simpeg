@@ -170,6 +170,7 @@ from .utils.solver_utils import (
     SolverDiag,
     SolverLU,
     SolverBiCG,
+    SolverUMFPACK,
 )
 
 __author__ = "SimPEG Team"
