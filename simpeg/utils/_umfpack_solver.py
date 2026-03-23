@@ -122,6 +122,9 @@ class SolverUMFPACK(Base):
             setattr(trans_obj, attr, value)
         trans_obj._umfpack = self._umfpack
         trans_obj._transposed = not self._transposed
+        # Keep a reference to prevent GC from freeing the shared context
+        # when the original solver goes out of scope.
+        trans_obj._parent = self
         return trans_obj
 
     def clean(self):

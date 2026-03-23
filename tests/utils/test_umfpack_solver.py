@@ -3,6 +3,7 @@
 import numpy as np
 import scipy.sparse as sp
 import pytest
+from pymatsolver import SolverLU
 from pymatsolver.solvers import Base
 
 from simpeg.utils._umfpack_solver import SolverUMFPACK, is_available
@@ -132,19 +133,76 @@ class TestSolverUMFPACK:
         x = solver * b
         np.testing.assert_allclose(A @ x, b, rtol=1e-10)
 
-    def test_agrees_with_superlu(self, poisson_3d):
-        """Verify UMFPACK and SuperLU produce the same solution."""
-        from pymatsolver import SolverLU
-
-        A, b = poisson_3d
-        x_umfpack = SolverUMFPACK(A) * b
-        x_superlu = SolverLU(A) * b
-        np.testing.assert_allclose(x_umfpack, x_superlu, rtol=1e-10)
-
     def test_clean(self, unsymmetric_system):
         A, b = unsymmetric_system
         solver = SolverUMFPACK(A)
         solver.clean()
+
+
+class TestUMFPACKParityWithSolverLU:
+    """Verify UMFPACK and SolverLU (SuperLU) produce identical results."""
+
+    def test_unsymmetric(self, unsymmetric_system):
+        A, b = unsymmetric_system
+        x_umf = SolverUMFPACK(A) * b
+        x_lu = SolverLU(A) * b
+        np.testing.assert_allclose(x_umf, x_lu, rtol=1e-10)
+
+    def test_spd(self, spd_system):
+        A, b = spd_system
+        x_umf = SolverUMFPACK(A) * b
+        x_lu = SolverLU(A) * b
+        np.testing.assert_allclose(x_umf, x_lu, rtol=1e-10)
+
+    def test_poisson_3d(self, poisson_3d):
+        A, b = poisson_3d
+        x_umf = SolverUMFPACK(A) * b
+        x_lu = SolverLU(A) * b
+        np.testing.assert_allclose(x_umf, x_lu, rtol=1e-10)
+
+    def test_multiple_rhs(self, unsymmetric_system, rng):
+        A, _ = unsymmetric_system
+        B = rng.standard_normal((A.shape[0], 5))
+        X_umf = SolverUMFPACK(A) * B
+        X_lu = SolverLU(A) * B
+        np.testing.assert_allclose(X_umf, X_lu, rtol=1e-10)
+
+    def test_transpose(self, unsymmetric_system):
+        A, b = unsymmetric_system
+        x_umf = SolverUMFPACK(A).T * b
+        x_lu = SolverLU(A).T * b
+        np.testing.assert_allclose(x_umf, x_lu, rtol=1e-10)
+
+    def test_complex(self, rng):
+        n = 100
+        A = (
+            sp.random(n, n, density=0.1, format="csc", random_state=rng)
+            + 1j * sp.random(n, n, density=0.1, format="csc", random_state=rng)
+            + 10 * sp.eye(n)
+        )
+        b = rng.standard_normal(n) + 1j * rng.standard_normal(n)
+        x_umf = SolverUMFPACK(A) * b
+        x_lu = SolverLU(A) * b
+        np.testing.assert_allclose(x_umf, x_lu, rtol=1e-10)
+
+    def test_ill_conditioned(self, rng):
+        """Both solvers should agree even on poorly conditioned systems."""
+        n = 50
+        A = sp.random(n, n, density=0.2, format="csc", random_state=rng)
+        A = A + 0.01 * sp.eye(n, format="csc")  # barely nonsingular
+        b = rng.standard_normal(n)
+        x_umf = SolverUMFPACK(A) * b
+        x_lu = SolverLU(A) * b
+        # Looser tolerance for ill-conditioned system
+        np.testing.assert_allclose(x_umf, x_lu, rtol=1e-6)
+
+    def test_csr_input(self, unsymmetric_system):
+        """Both solvers should handle CSR input identically."""
+        A, b = unsymmetric_system
+        A_csr = A.tocsr()
+        x_umf = SolverUMFPACK(A_csr) * b
+        x_lu = SolverLU(A_csr) * b
+        np.testing.assert_allclose(x_umf, x_lu, rtol=1e-10)
 
 
 class TestUMFPACKDefaultSolver:
