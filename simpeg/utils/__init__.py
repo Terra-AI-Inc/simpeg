@@ -271,5 +271,5 @@ from .pgi_utils import (
     GaussianMixtureWithNonlinearRelationships,
     GaussianMixtureWithNonlinearRelationshipsWithPrior,
 )
-from .solver_utils import get_default_solver, set_default_solver
+from .solver_utils import get_default_solver, set_default_solver, SolverUMFPACK
 from .warnings import BreakingChangeWarning, PerformanceWarning
