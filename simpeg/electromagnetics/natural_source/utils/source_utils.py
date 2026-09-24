@@ -5,6 +5,7 @@ Utility functions for NSEM sources.
 import numpy as np
 from scipy.constants import mu_0
 import scipy.sparse as sp
+from scipy.sparse.linalg import splu
 from discretize import TensorMesh
 
 from ...utils import omega
@@ -173,6 +174,77 @@ def primary_e_1d_solution(
     if n_pad != 0:
         e_1d = e_1d[n_pad:]
     return e_1d
+
+
+def _primary_e_1d_solution_and_deriv(mesh, sigma_1d, freq, skin_depth_factor=3.0):
+    """1D electric field solution and its derivative with respect to conductivity.
+
+    Solves the same discrete system as :func:`primary_e_1d_solution` with its
+    default boundary conditions (``top_bc="dirichlet"``, ``bot_bc="robin"``).
+
+    Parameters
+    ----------
+    mesh : discretize.base.BaseTensorMesh
+        A 1d, 2d or 3d tensor mesh or tree mesh.
+    sigma_1d : (n_z,) numpy.ndarray
+        1D conductivity model defined from the bottom cell upwards.
+    freq : float
+        Operating frequency in Hz.
+    skin_depth_factor : float
+        Number of additional skin depths added to the bottom of the 1D mesh.
+
+    Returns
+    -------
+    e_1d : (n_z + 1,) numpy.ndarray
+        Electric field on the nodes of the vertical discretization.
+    de_dsigma : (n_z + 1, n_z) numpy.ndarray
+        Derivative of ``e_1d`` with respect to ``sigma_1d``.
+    """
+    hz = mesh.h[-1]
+    if len(hz) != len(sigma_1d):
+        raise ValueError(
+            "Number of cells in vertical direction must match length of "
+            f"'sigma_1d'. Here hz has length {len(hz)} and sigma_1d has "
+            f"length {len(sigma_1d)}"
+        )
+
+    w = omega(freq)
+    skin_depth = np.sqrt(2 / (w * mu_0 * sigma_1d[0]))
+    n_pad = int(np.ceil(skin_depth_factor * skin_depth / hz[0]))
+
+    hz_ext = np.pad(hz, (n_pad, 0), mode="edge")
+    mesh_ext = TensorMesh([hz_ext], origin=[mesh.origin[-1] - hz[0] * n_pad])
+    sigma_ext = np.pad(sigma_1d, (n_pad, 0), mode="edge")
+
+    G = mesh_ext.nodal_gradient
+    M_e_mui = mesh_ext.get_edge_inner_product(mu_0, invert_model=True)
+    M_f_sigma = mesh_ext.get_face_inner_product(sigma_ext)
+    k_bot = np.sqrt(-1.0j * w * mu_0 * sigma_ext[0])
+    robin = sp.csr_matrix(
+        ([1j * k_bot / mu_0], ([0], [0])), shape=(mesh_ext.n_nodes, mesh_ext.n_nodes)
+    )
+    A = (G.T @ M_e_mui @ G + 1j * w * M_f_sigma + robin).tocsc()
+
+    # the field is fixed to 1 at the top node
+    A_free = A[:-1, :-1]
+    lu = splu(A_free)
+    e = np.r_[lu.solve(-A[:-1, -1].toarray().ravel()), 1.0]
+
+    # d(A e)/d(sigma_ext), then chain through the padding (copies sigma_1d[0])
+    dAe = 1j * w * mesh_ext.get_face_inner_product_deriv(sigma_ext)(e)
+    dAe = dAe + sp.csr_matrix(
+        ([1j * k_bot / (2 * sigma_ext[0] * mu_0) * e[0]], ([0], [0])),
+        shape=dAe.shape,
+    )
+    pad_cols = np.maximum(np.arange(len(hz_ext)) - n_pad, 0)
+    P_pad = sp.csr_matrix(
+        (np.ones(len(hz_ext)), (np.arange(len(hz_ext)), pad_cols)),
+        shape=(len(hz_ext), len(hz)),
+    )
+    rhs = (dAe @ P_pad)[:-1].toarray()
+    de = np.vstack([-lu.solve(rhs), np.zeros((1, len(hz)))])
+
+    return e[n_pad:], de[n_pad:]
 
 
 def primary_h_1d_solution(
