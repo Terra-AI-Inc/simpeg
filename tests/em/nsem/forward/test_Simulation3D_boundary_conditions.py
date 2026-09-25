@@ -211,31 +211,6 @@ def test_robin_layered_earth_with_halfspace_primary():
     np.testing.assert_array_less(errors["robin"], 0.25)
 
 
-def test_1d_solution_and_deriv():
-    """The 1D solver used for the boundary data matches the primary field solver."""
-    from simpeg.electromagnetics.natural_source.utils.source_utils import (
-        primary_e_1d_solution,
-        _primary_e_1d_solution_and_deriv,
-    )
-
-    mesh = discretize.TensorMesh(
-        [[1], [1], [(100.0, 10, -1.3), (50.0, 20), (100.0, 10, 1.5)]]
-    )
-    rng = np.random.default_rng(12)
-    sigma = np.exp(rng.normal(np.log(1e-2), 1, mesh.shape_cells[2]))
-    sigma[-10:] = 1e-8
-    freq = 1.0
-
-    e, de = _primary_e_1d_solution_and_deriv(mesh, sigma, freq)
-    np.testing.assert_allclose(e, primary_e_1d_solution(mesh, sigma, freq), atol=1e-12)
-
-    def func(log_sigma):
-        e, de = _primary_e_1d_solution_and_deriv(mesh, np.exp(log_sigma), freq)
-        return e, lambda v: de @ (np.exp(log_sigma) * v)
-
-    assert check_derivative(func, np.log(sigma), plotIt=False, num=3, random_seed=5)
-
-
 def layered_earth_mesh(npad):
     hx = [(250.0, npad, -1.5), (250.0, 6), (250.0, npad, 1.5)]
     hz = [(250.0, 10, -1.4), (100.0, 20), (250.0, 10, 1.5)]

@@ -11,10 +11,7 @@ from ..frequency_domain.simulation import BaseFDEMSimulation, Simulation3DElectr
 from ..frequency_domain.survey import Survey
 from ..utils import omega
 from .sources import Planewave
-from .utils.source_utils import (
-    primary_e_1d_solution,
-    _primary_e_1d_solution_and_deriv,
-)
+from .utils.source_utils import primary_e_1d_solution
 from .receivers import Impedance, Tipper, Admittance
 from .fields import (
     Fields1DPrimarySecondary,
@@ -38,6 +35,35 @@ def _centers_to_widths(centers):
 ###################################
 # 1D problems
 ###################################
+
+
+def _bottom_robin_matrix(n, value):
+    """Sparse (n, n) matrix with ``value`` in the entry for the bottom node."""
+    return sp.csr_matrix(([value], ([0], [0])), shape=(n, n))
+
+
+def _bottom_robin_deriv(prop_deriv, d_value, u, v, adjoint):
+    """Derivative of the bottom Robin term times ``u`` with respect to the model.
+
+    The term only depends on the property of the bottom cell (cell 0), through
+    ``d_value``, and only acts on the bottom node (node 0).
+    """
+    # squeeze like _inner_mat_mul_op, so the shapes of the two parts match
+    u = np.squeeze(np.asarray(u))
+    v = np.squeeze(np.asarray(v))
+    e0 = np.zeros(prop_deriv.shape[0])
+    e0[0] = 1.0
+    deriv_row = prop_deriv.T @ e0
+    if adjoint:
+        coef = d_value * u[0] * v[0]
+        if u.ndim > 1:
+            # sum over the fields stored in the columns of u
+            coef = np.sum(coef)
+        return np.multiply.outer(deriv_row, coef) if np.ndim(coef) else deriv_row * coef
+    d_prop = deriv_row @ v
+    out = np.zeros((u.shape[0],) + np.broadcast(u[0], d_prop).shape, dtype=complex)
+    out[0] = d_value * u[0] * d_prop
+    return out
 
 
 class Simulation1DElectricField(BaseFDEMSimulation):
@@ -93,16 +119,38 @@ class Simulation1DElectricField(BaseFDEMSimulation):
         MeMui = self.MeMui
         MfSigma = self.MfSigma
 
-        return G.T.tocsr() @ MeMui @ G + 1j * omega(freq) * MfSigma
+        A = G.T.tocsr() @ MeMui @ G + 1j * omega(freq) * MfSigma
+        return A + _bottom_robin_matrix(A.shape[0], self._bottom_robin(freq)[0])
+
+    def _bottom_robin(self, freq):
+        r"""Robin (downgoing plane wave) term at the bottom node.
+
+        :math:`i k / \mu` with :math:`k = \sqrt{-i \omega \mu \sigma}` for the
+        bottom cell, and its derivatives with respect to the bottom cell's
+        conductivity and inverse permeability.
+        """
+        sigma = np.atleast_1d(self.sigma)[0]
+        mui = np.atleast_1d(self.mui)[0]
+        value = 1j * np.sqrt(-1j * omega(freq) * sigma * mui)
+        return value, value / (2 * sigma), value / (2 * mui)
 
     def getADeriv_sigma(self, freq, u, v, adjoint=False):
-        return 1j * omega(freq) * self.MfSigmaDeriv(u, v, adjoint=adjoint)
+        dA_v = 1j * omega(freq) * self.MfSigmaDeriv(u, v, adjoint=adjoint)
+        if self.sigmaMap is None:
+            return dA_v
+        d_value = self._bottom_robin(freq)[1]
+        return dA_v + _bottom_robin_deriv(self.sigmaDeriv, d_value, u, v, adjoint)
 
     def getADeriv_mui(self, freq, u, v, adjoint=False):
         G = self.mesh.nodal_gradient
         if adjoint:
-            return self.MeMuiDeriv(G * u, G * v, adjoint)
-        return G.T * self.MeMuiDeriv(G * u, v, adjoint)
+            dA_v = self.MeMuiDeriv(G * u, G * v, adjoint)
+        else:
+            dA_v = G.T * self.MeMuiDeriv(G * u, v, adjoint)
+        if self.muiMap is None:
+            return dA_v
+        d_value = self._bottom_robin(freq)[2]
+        return dA_v + _bottom_robin_deriv(self.muiDeriv, d_value, u, v, adjoint)
 
     def getRHS(self, freq):
         """
@@ -168,20 +216,42 @@ class Simulation1DMagneticField(BaseFDEMSimulation):
         MeRho = self.MeRho
         MnMu = self.MnMu
 
-        return G.T.tocsr() @ MeRho @ G + 1j * omega(freq) * MnMu
+        A = G.T.tocsr() @ MeRho @ G + 1j * omega(freq) * MnMu
+        return A + _bottom_robin_matrix(A.shape[0], self._bottom_robin(freq)[0])
+
+    def _bottom_robin(self, freq):
+        r"""Robin (downgoing plane wave) term at the bottom node.
+
+        :math:`i k \rho` with :math:`k = \sqrt{-i \omega \mu \sigma}` for the
+        bottom cell, and its derivatives with respect to the bottom cell's
+        resistivity and permeability.
+        """
+        rho = np.atleast_1d(self.rho)[0]
+        mu = np.atleast_1d(self.mu)[0]
+        value = 1j * np.sqrt(-1j * omega(freq) * mu * rho)
+        return value, value / (2 * rho), value / (2 * mu)
 
     def getADeriv_rho(self, freq, u, v, adjoint=False):
         G = self.mesh.nodal_gradient
         if adjoint:
-            return self.MeRhoDeriv(G * u, G * v, adjoint)
-        return G.T * self.MeRhoDeriv(G * u, v, adjoint)
+            dA_v = self.MeRhoDeriv(G * u, G * v, adjoint)
+        else:
+            dA_v = G.T * self.MeRhoDeriv(G * u, v, adjoint)
+        if self.rhoMap is None:
+            return dA_v
+        d_value = self._bottom_robin(freq)[1]
+        return dA_v + _bottom_robin_deriv(self.rhoDeriv, d_value, u, v, adjoint)
 
     def getADeriv_mu(self, freq, u, v, adjoint=False):
         MnMuDeriv = self.MnMuDeriv(u)
         if adjoint is True:
-            return 1j * omega(freq) * (MnMuDeriv.T * v)
-
-        return 1j * omega(freq) * (MnMuDeriv * v)
+            dA_v = 1j * omega(freq) * (MnMuDeriv.T * v)
+        else:
+            dA_v = 1j * omega(freq) * (MnMuDeriv * v)
+        if self.muMap is None:
+            return dA_v
+        d_value = self._bottom_robin(freq)[2]
+        return dA_v + _bottom_robin_deriv(self.muDeriv, d_value, u, v, adjoint)
 
     def getRHS(self, freq):
         """
@@ -296,6 +366,43 @@ class Simulation1DPrimarySecondary(Simulation1DElectricField):
 ###################################
 # 2D problems
 ###################################
+def _bottom_robin_ops_2d(mesh):
+    """Operators for a Robin term on the bottom boundary edges of a 2D mesh.
+
+    Returns
+    -------
+    P : (n_bottom_edges, n_edges) scipy.sparse.csr_matrix
+        Selects the edges on the bottom boundary.
+    K : (n_bottom_edges, n_cells) scipy.sparse.csr_matrix
+        The length of each bottom edge, at the cell above it.
+    """
+    edges = np.r_[mesh.edges_x, mesh.edges_y]
+    bottom = np.where(
+        np.isclose(edges[:, 1], mesh.nodes_y[0])
+        & (np.arange(len(edges)) < mesh.n_edges_x)
+    )[0]
+    n_bot = len(bottom)
+    P = sp.csr_matrix(
+        (np.ones(n_bot), (np.arange(n_bot), bottom)), shape=(n_bot, mesh.n_edges)
+    )
+    eps = 1e-3 * mesh.h[1].min()
+    cells = mesh.point2index(edges[bottom] + np.r_[0.0, eps])
+    K = sp.csr_matrix(
+        (mesh.edge_lengths[bottom], (np.arange(n_bot), cells)),
+        shape=(n_bot, mesh.n_cells),
+    )
+    return P, K
+
+
+def _bottom_robin_deriv_2d(ops, scale, dg_dm, u, v, adjoint):
+    """Model derivative of ``scale * P.T @ diag(K @ g) @ P @ u``."""
+    P, K = ops
+    dKg_dm = K @ dg_dm
+    if adjoint:
+        return _inner_mat_mul_op(dKg_dm, P @ u, P @ (scale * v), adjoint=True)
+    return scale * (P.T @ _inner_mat_mul_op(dKg_dm, P @ u, v))
+
+
 class Simulation2DElectricField(BaseFDEMSimulation):
     """
     A
@@ -425,7 +532,31 @@ class Simulation2DElectricField(BaseFDEMSimulation):
         Mcc_mui = self.MccMui
         Me_sigma = self.MeSigma
 
-        return C.T.tocsr() @ Mcc_mui @ C + 1j * omega(freq) * Me_sigma
+        A = C.T.tocsr() @ Mcc_mui @ C + 1j * omega(freq) * Me_sigma
+        if self._h_bc is None:
+            A = A + self._bottom_robin_matrix(freq)
+        return A
+
+    def _bottom_robin_values(self):
+        sigma = np.broadcast_to(self.sigma, (self.mesh.n_cells,))
+        mui = np.broadcast_to(self.mui, (self.mesh.n_cells,))
+        return sigma, mui, np.sqrt(sigma * mui)
+
+    def _bottom_robin_matrix(self, freq):
+        r"""Robin (downgoing plane wave) term on the bottom boundary edges.
+
+        :math:`\sqrt{i \omega \sigma / \mu}` of the bottom cells, integrated
+        along the bottom boundary.
+        """
+        P, K = self._bottom_robin_ops
+        scale = np.sqrt(1j * omega(freq))
+        return scale * (P.T @ sp.diags(K @ self._bottom_robin_values()[2]) @ P)
+
+    @property
+    def _bottom_robin_ops(self):
+        if getattr(self, "_bottom_robin_ops_cache", None) is None:
+            self._bottom_robin_ops_cache = _bottom_robin_ops_2d(self.mesh)
+        return self._bottom_robin_ops_cache
 
     def getRHS(self, freq):
         """
@@ -446,13 +577,30 @@ class Simulation2DElectricField(BaseFDEMSimulation):
         return 1j * omega(freq) * (M_bc @ h_bc)
 
     def getADeriv_sigma(self, freq, u, v, adjoint=False):
-        return 1j * omega(freq) * self.MeSigmaDeriv(u, v, adjoint=adjoint)
+        dA_v = 1j * omega(freq) * self.MeSigmaDeriv(u, v, adjoint=adjoint)
+        if self._h_bc is not None or self.sigmaMap is None:
+            return dA_v
+        sigma, _, g = self._bottom_robin_values()
+        dg_dm = sp.diags(0.5 * g / sigma) @ self.sigmaDeriv
+        scale = np.sqrt(1j * omega(freq))
+        return dA_v + _bottom_robin_deriv_2d(
+            self._bottom_robin_ops, scale, dg_dm, u, v, adjoint
+        )
 
     def getADeriv_mui(self, freq, u, v, adjoint=False):
         C = self.mesh.edge_curl
         if adjoint:
-            return self.MccMuiDeriv(C * u, C * v, adjoint)
-        return C.T * self.MccMuiDeriv(C * u, v, adjoint)
+            dA_v = self.MccMuiDeriv(C * u, C * v, adjoint)
+        else:
+            dA_v = C.T * self.MccMuiDeriv(C * u, v, adjoint)
+        if self._h_bc is not None or self.muiMap is None:
+            return dA_v
+        _, mui, g = self._bottom_robin_values()
+        dg_dm = sp.diags(0.5 * g / mui) @ self.muiDeriv
+        scale = np.sqrt(1j * omega(freq))
+        return dA_v + _bottom_robin_deriv_2d(
+            self._bottom_robin_ops, scale, dg_dm, u, v, adjoint
+        )
 
     def getADeriv(self, freq, u, v, adjoint=False):
         return self.getADeriv_sigma(freq, u, v, adjoint) + self.getADeriv_mui(
@@ -653,7 +801,31 @@ class Simulation2DMagneticField(BaseFDEMSimulation):
         Mcc_rho = self.MccRho
         Me_mu = self.MeMu
 
-        return C.T.tocsr() @ Mcc_rho @ C + 1j * omega(freq) * Me_mu
+        A = C.T.tocsr() @ Mcc_rho @ C + 1j * omega(freq) * Me_mu
+        if self._e_bc is None:
+            A = A + self._bottom_robin_matrix(freq)
+        return A
+
+    def _bottom_robin_values(self):
+        rho = np.broadcast_to(self.rho, (self.mesh.n_cells,))
+        mu = np.broadcast_to(self.mu, (self.mesh.n_cells,))
+        return rho, mu, np.sqrt(rho * mu)
+
+    def _bottom_robin_matrix(self, freq):
+        r"""Robin (downgoing plane wave) term on the bottom boundary edges.
+
+        :math:`i \sqrt{-i \omega \mu \rho}` of the bottom cells, integrated
+        along the bottom boundary.
+        """
+        P, K = self._bottom_robin_ops
+        scale = 1j * np.sqrt(-1j * omega(freq))
+        return scale * (P.T @ sp.diags(K @ self._bottom_robin_values()[2]) @ P)
+
+    @property
+    def _bottom_robin_ops(self):
+        if getattr(self, "_bottom_robin_ops_cache", None) is None:
+            self._bottom_robin_ops_cache = _bottom_robin_ops_2d(self.mesh)
+        return self._bottom_robin_ops_cache
 
     def getRHS(self, freq):
         """
@@ -676,11 +848,28 @@ class Simulation2DMagneticField(BaseFDEMSimulation):
     def getADeriv_rho(self, freq, u, v, adjoint=False):
         C = self.mesh.edge_curl
         if adjoint:
-            return self.MccRhoDeriv(C * u, C * v, adjoint)
-        return C.T * self.MccRhoDeriv(C * u, v, adjoint)
+            dA_v = self.MccRhoDeriv(C * u, C * v, adjoint)
+        else:
+            dA_v = C.T * self.MccRhoDeriv(C * u, v, adjoint)
+        if self._e_bc is not None or self.rhoMap is None:
+            return dA_v
+        rho, _, g = self._bottom_robin_values()
+        dg_dm = sp.diags(0.5 * g / rho) @ self.rhoDeriv
+        scale = 1j * np.sqrt(-1j * omega(freq))
+        return dA_v + _bottom_robin_deriv_2d(
+            self._bottom_robin_ops, scale, dg_dm, u, v, adjoint
+        )
 
     def getADeriv_mu(self, freq, u, v, adjoint=False):
-        return 1j * omega(freq) * self.MeMuDeriv(u, v, adjoint=adjoint)
+        dA_v = 1j * omega(freq) * self.MeMuDeriv(u, v, adjoint=adjoint)
+        if self._e_bc is not None or self.muMap is None:
+            return dA_v
+        _, mu, g = self._bottom_robin_values()
+        dg_dm = sp.diags(0.5 * g / mu) @ self.muDeriv
+        scale = 1j * np.sqrt(-1j * omega(freq))
+        return dA_v + _bottom_robin_deriv_2d(
+            self._bottom_robin_ops, scale, dg_dm, u, v, adjoint
+        )
 
     def getADeriv(self, freq, u, v, adjoint=False):
         return self.getADeriv_rho(freq, u, v, adjoint) + self.getADeriv_mu(
@@ -1106,38 +1295,36 @@ class Simulation3DPrimarySecondary(Simulation3DElectricField):
             }
         return self._robin_1d_geom
 
-    def _robin_1d_boundary_data(self, freq, src, deriv=False):
-        """Right hand side boundary data from the local 1D boundary fields.
+    def _robin_1d_columns(self, freq, src):
+        """1D simulations and difference fields for the lateral boundary columns.
 
-        Parameters
-        ----------
-        freq : float
-            The frequency in Hz.
-        src : .natural_source.sources.PlanewaveXYPrimary
-            The source.
-        deriv : bool
-            Whether to also return the derivatives with respect to the
-            conductivity of the cells.
+        Each unique column of conductivity along the lateral boundaries is solved
+        with :class:`Simulation1DElectricField` on the same padded vertical
+        discretization used for the primary field, so that a column matching the
+        primary model gives exactly zero difference field.
 
         Returns
         -------
-        rhs : (n_edges, 2) numpy.ndarray
-            Boundary data for the x and y polarizations.
-        drhs_dsigma : tuple of (n_edges, n_cells) scipy.sparse.csr_matrix
-            Only returned if ``deriv`` is ``True``.
+        dict
+            ``"e_d"`` : (n_columns, n_z + 1) numpy.ndarray
+                Difference field :math:`e_{1D} - e_p` on the vertical nodes of
+                each boundary column.
+            ``"groups"`` : list of dict
+                One per unique column, with the 1D simulation and what is
+                needed for derivatives.
         """
         key = (freq, id(src))
         cache = getattr(self, "_robin_1d_cache", None)
         if cache is None:
             cache = self._robin_1d_cache = {}
-        if key in cache and (not deriv or len(cache[key]) > 1):
-            return cache[key] if deriv else cache[key][0]
+        if key in cache:
+            return cache[key]
 
         mesh = self.mesh
         geom = self._robin_1d_geometry
         w = omega(freq)
         hz = mesh.h[2]
-        z_nodes = mesh.nodes_z
+        n_z = len(hz)
 
         sigma = self.sigma
         if np.size(sigma) == 1:
@@ -1147,80 +1334,196 @@ class Simulation3DPrimarySecondary(Simulation3DElectricField):
         sigma_1d, _ = src._get_sigmas(self)
         e_p = primary_e_1d_solution(mesh, sigma_1d, freq)
 
-        def h_top(e):
-            # y component of h for an x-polarized field in the top cell
-            return -(e[..., -1] - e[..., -2]) / hz[-1] / (1j * w * mu_0)
+        # h in the top cell for an x-polarized field, as a linear function of e
+        h_top = np.zeros(n_z + 1, dtype=complex)
+        h_top[-1] = -1 / (hz[-1] * 1j * w * mu_0)
+        h_top[-2] = 1 / (hz[-1] * 1j * w * mu_0)
+        h_top_p = h_top @ e_p
 
         unique_sigma, inverse = np.unique(column_sigma, axis=0, return_inverse=True)
         inverse = inverse.ravel()
-        e_d = np.empty((len(unique_sigma), len(z_nodes)), dtype=complex)
-        de_d = np.empty((len(unique_sigma), len(z_nodes), len(hz)), dtype=complex)
+        e_d = np.empty((len(geom["column_cells"]), n_z + 1), dtype=complex)
+        groups = []
+        survey_1d = Survey([Planewave([], freq)])
         for i, sig in enumerate(unique_sigma):
-            e_1d, de_1d = _primary_e_1d_solution_and_deriv(mesh, sig, freq)
-            # use the same magnetic field at the top of the mesh as the primary
-            scale = h_top(e_p) / h_top(e_1d)
-            e_d[i] = scale * e_1d - e_p
-            if deriv:
-                de_d[i] = scale * (de_1d - np.outer(e_1d, h_top(de_1d.T) / h_top(e_1d)))
+            # pad below by a few skin depths, as the primary field solver does
+            skin_depth = np.sqrt(2 / (w * mu_0 * sig[0]))
+            n_pad = int(np.ceil(3.0 * skin_depth / hz[0]))
+            mesh_1d = TensorMesh(
+                [np.pad(hz, (n_pad, 0), mode="edge")],
+                origin=[mesh.origin[2] - hz[0] * n_pad],
+            )
+            pad_map = maps.Projection(
+                n_z, np.r_[np.zeros(n_pad, dtype=int), np.arange(n_z)]
+            )
+            sim_1d = Simulation1DElectricField(
+                mesh_1d, survey=survey_1d, sigmaMap=pad_map, solver=self.solver
+            )
+            fields_1d = sim_1d.fields(sig)
+            u_1d = fields_1d[survey_1d.source_list[0], "e"][:, 0]
+            e_1d = u_1d[n_pad:]
+            # the difference field has the same h as the primary at the top
+            scale = h_top_p / (h_top @ e_1d)
+            columns = np.where(inverse == i)[0]
+            e_d[columns] = scale * e_1d - e_p
+            groups.append(
+                {
+                    "sim": sim_1d,
+                    "u": u_1d,
+                    "n_pad": n_pad,
+                    "e": e_1d,
+                    "scale": scale,
+                    "columns": columns,
+                }
+            )
 
-        col = inverse[geom["column"]]
-        k_bot, k_top = geom["k_bot"], geom["k_top"]
-        dz = z_nodes[k_top] - z_nodes[k_bot]
-        is_vertical = geom["edge_type"] == 2
-        dz[~is_vertical] = 1.0
+        cache[key] = {"e_d": e_d, "groups": groups, "h_top": h_top}
+        return cache[key]
 
-        # E_d along horizontal edges and the y component of h_d (x-polarization)
-        # on vertical edges; the y-polarization has h_d = -h_y x_hat.
-        E = e_d[col, k_bot]
-        Hy = -(e_d[col, k_top] - e_d[col, k_bot]) / dz / (1j * w * mu_0)
+    def _robin_1d_pair_fields(self, freq, e_columns):
+        """Boundary values of a set of column fields at each (face, edge) pair.
+
+        Returns ``E`` along the horizontal edges, and the y component of h for
+        the x polarization (``Hy``) on the vertical edges; the y polarization
+        has h = -Hy x_hat.
+        """
+        geom = self._robin_1d_geometry
+        z_nodes = self.mesh.nodes_z
+        col, k_bot, k_top = geom["column"], geom["k_bot"], geom["k_top"]
+        dz = np.where(geom["edge_type"] == 2, z_nodes[k_top] - z_nodes[k_bot], 1.0)
+        E = e_columns[col, k_bot]
+        Hy = -(e_columns[col, k_top] - E) / dz / (1j * omega(freq) * mu_0)
+        return E, Hy, dz
+
+    def _robin_1d_assemble(self, values):
+        """Sum the values of each (face, edge) pair onto the edges."""
+        edge = self._robin_1d_geometry["edge"]
+        n = self.mesh.n_edges
+        return np.bincount(edge, values.real, minlength=n) + 1j * np.bincount(
+            edge, values.imag, minlength=n
+        )
+
+    def _robin_1d_boundary_data(self, freq, src):
+        """Right hand side boundary data from the local 1D boundary fields.
+
+        Returns
+        -------
+        (n_edges, 2) numpy.ndarray
+            Boundary data for the x and y polarizations.
+        """
+        geom = self._robin_1d_geometry
+        w = omega(freq)
+        E, Hy, _ = self._robin_1d_pair_fields(
+            freq, self._robin_1d_columns(freq, src)["e_d"]
+        )
         admittivity = self._boundary_admittivity(freq)[geom["cell"]]
         a = np.sqrt(1j * w * admittivity / mu_0)
-        weight = geom["weight"]
-        normal = geom["normal"]
-
-        rhs = np.zeros((mesh.n_edges, 2), dtype=complex)
-        derivs = []
+        is_vertical = geom["edge_type"] == 2
+        rhs = np.zeros((self.mesh.n_edges, 2), dtype=complex)
         for pol in range(2):
             is_tangent = geom["edge_type"] == pol
-            n_comp = normal[:, 0] if pol == 0 else normal[:, 1]
-            values = weight * (
+            values = geom["weight"] * (
                 np.where(is_tangent, a * E, 0.0)
-                + np.where(is_vertical, 1j * w * n_comp * Hy, 0.0)
+                + np.where(is_vertical, 1j * w * geom["normal"][:, pol] * Hy, 0.0)
             )
-            rhs[:, pol] = np.bincount(
-                geom["edge"], values.real, minlength=mesh.n_edges
-            ) + 1j * np.bincount(geom["edge"], values.imag, minlength=mesh.n_edges)
+            rhs[:, pol] = self._robin_1d_assemble(values)
+        return rhs
 
-            if deriv:
-                cells = geom["column_cells"][geom["column"]]
-                h, v = is_tangent, is_vertical
-                # through the admittance of the adjacent cell
-                rows = [geom["edge"][h]]
-                cols = [geom["cell"][h]]
-                vals = [weight[h] * 0.5 * a[h] / admittivity[h] * E[h]]
-                # through the 1D field along the column
-                dE = de_d[col[h], k_bot[h]]
-                rows.append(np.repeat(geom["edge"][h], len(hz)))
-                cols.append(cells[h].ravel())
-                vals.append(((weight[h] * a[h])[:, None] * dE).ravel())
-                dHy = -(de_d[col[v], k_top[v]] - de_d[col[v], k_bot[v]]) / (
-                    dz[v, None] * mu_0
-                )
-                rows.append(np.repeat(geom["edge"][v], len(hz)))
-                cols.append(cells[v].ravel())
-                vals.append(((weight[v] * n_comp[v])[:, None] * dHy).ravel())
-                derivs.append(
-                    sp.csr_matrix(
-                        (
-                            np.concatenate(vals),
-                            (np.concatenate(rows), np.concatenate(cols)),
-                        ),
-                        shape=(mesh.n_edges, mesh.n_cells),
-                    )
-                )
+    def _robin_1d_boundary_data_deriv(self, freq, src, v, adjoint=False):
+        """Derivative of the boundary data with respect to the conductivity of the cells.
 
-        cache[key] = (rhs, tuple(derivs)) if deriv else (rhs,)
-        return cache[key] if deriv else rhs
+        Parameters
+        ----------
+        v : numpy.ndarray
+            (n_cells,) for the standard operation, (n_edges, 2) or
+            (n_edges, n, 2) for the adjoint operation.
+
+        Returns
+        -------
+        numpy.ndarray
+            (n_edges, 2) for the standard operation, (n_cells,) or
+            (n_cells, n) for the adjoint operation.
+        """
+        mesh = self.mesh
+        geom = self._robin_1d_geometry
+        w = omega(freq)
+        columns = self._robin_1d_columns(freq, src)
+        h_top = columns["h_top"]
+        cells = geom["column_cells"]
+        n_z = cells.shape[1]
+
+        E, _, dz = self._robin_1d_pair_fields(freq, columns["e_d"])
+        admittivity = self._boundary_admittivity(freq)[geom["cell"]]
+        a = np.sqrt(1j * w * admittivity / mu_0)
+        da = 0.5 * a / admittivity
+        weight, normal = geom["weight"], geom["normal"]
+        is_vertical = geom["edge_type"] == 2
+        col, k_bot, k_top = geom["column"], geom["k_bot"], geom["k_top"]
+
+        if not adjoint:
+            # perturbation of each column's difference field, through its 1D simulation
+            de_d = np.zeros((cells.shape[0], n_z + 1), dtype=complex)
+            for group in columns["groups"]:
+                sim, n_pad = group["sim"], group["n_pad"]
+                dsigma = v[cells[group["columns"]]].T  # (n_z, n_columns)
+                du = -(sim.Ainv[0] * sim.getADeriv(freq, group["u"], dsigma))
+                de = du.reshape(len(group["u"]), -1)[n_pad:]
+                e = group["e"]
+                de_d[group["columns"]] = (
+                    group["scale"] * (de - np.outer(e, h_top @ de) / (h_top @ e))
+                ).T
+
+            dE, dHy, _ = self._robin_1d_pair_fields(freq, de_d)
+            dsigma_cell = v[geom["cell"]]
+            out = np.zeros((mesh.n_edges, 2), dtype=complex)
+            for pol in range(2):
+                is_tangent = geom["edge_type"] == pol
+                values = weight * (
+                    np.where(is_tangent, a * dE + da * dsigma_cell * E, 0.0)
+                    + np.where(is_vertical, 1j * w * normal[:, pol] * dHy, 0.0)
+                )
+                out[:, pol] = self._robin_1d_assemble(values)
+            return out
+
+        v = np.asarray(v).reshape(mesh.n_edges, -1, 2)
+        n_rhs = v.shape[1]
+        dsigma = np.zeros((mesh.n_cells, n_rhs), dtype=complex)
+        # sensitivity of v . rhs to each column's difference field
+        g = np.zeros((cells.shape[0], n_z + 1, n_rhs), dtype=complex)
+        c_h = 1j * w * weight / (dz * 1j * w * mu_0)
+        for pol in range(2):
+            vp = v[geom["edge"], :, pol]  # (n_pairs, n_rhs)
+            is_tangent = (geom["edge_type"] == pol)[:, None]
+            np.add.at(
+                dsigma,
+                geom["cell"],
+                np.where(is_tangent, (weight * da * E)[:, None] * vp, 0.0),
+            )
+            np.add.at(
+                g, (col, k_bot), np.where(is_tangent, (weight * a)[:, None] * vp, 0.0)
+            )
+            gh = np.where(
+                is_vertical[:, None], (c_h * normal[:, pol])[:, None] * vp, 0.0
+            )
+            np.add.at(g, (col, k_top), -gh)
+            np.add.at(g, (col, k_bot), gh)
+
+        for group in columns["groups"]:
+            sim, n_pad, e = group["sim"], group["n_pad"], group["e"]
+            cols = group["columns"]
+            g_e = (
+                g[cols].transpose(1, 0, 2).reshape(n_z + 1, -1)
+            )  # (n_z + 1, n_cols * n_rhs)
+            g_e = group["scale"] * (g_e - np.outer(h_top, e @ g_e) / (h_top @ e))
+            g_ext = np.zeros((len(group["u"]), g_e.shape[1]), dtype=complex)
+            g_ext[n_pad:] = g_e
+            lam = sim.Ainv[0] * g_ext
+            dsig_col = -sim.getADeriv(
+                freq, group["u"], lam.reshape(len(group["u"]), -1), adjoint=True
+            )
+            dsig_col = np.asarray(dsig_col).reshape(n_z, len(cols), n_rhs)
+            np.add.at(dsigma, cells[cols].T, dsig_col)
+        return dsigma[:, 0] if n_rhs == 1 else dsigma
 
     def getRHS(self, freq):
         r"""Right-hand sides for the given frequency.
@@ -1277,15 +1580,11 @@ class Simulation3DPrimarySecondary(Simulation3DElectricField):
         if self.boundary_condition != "robin_1d" or self.sigmaMap is None:
             return drhs
 
-        _, (d_x, d_y) = self._robin_1d_boundary_data(freq, src, deriv=True)
         if adjoint:
-            v = np.asarray(v).reshape(self.mesh.n_edges, -1, 2)
-            dsigma = d_x.T @ v[:, :, 0] + d_y.T @ v[:, :, 1]
+            dsigma = self._robin_1d_boundary_data_deriv(freq, src, v, adjoint=True)
             d_bnd = self.sigmaDeriv.T @ dsigma
-            d_bnd = d_bnd[:, 0] if d_bnd.shape[1] == 1 else d_bnd
         else:
-            dsigma = self.sigmaDeriv @ v
-            d_bnd = np.column_stack([d_x @ dsigma, d_y @ dsigma])
+            d_bnd = self._robin_1d_boundary_data_deriv(freq, src, self.sigmaDeriv @ v)
         if isinstance(drhs, Zero):
             return d_bnd
         return drhs + d_bnd.reshape(np.shape(drhs))
