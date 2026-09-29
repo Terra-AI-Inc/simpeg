@@ -18,6 +18,7 @@ from .fields import (
     Fields1DMagneticField,
     Fields2DElectricField,
     Fields2DMagneticField,
+    Fields2DNodalElectricField,
 )
 
 
@@ -1133,6 +1134,156 @@ class Simulation2DMagneticField(_RobinBoundary2D, BaseFDEMSimulation):
         items = super()._delete_on_model_update
         items.append("_boundary_fields")
         return items
+
+
+class Simulation2DNodalElectricField(BaseFDEMSimulation):
+    r"""2D natural source simulation with the electric field on nodes.
+
+    Solves for the electric field normal to the 2D plane, :math:`E_y`, on the
+    nodes of the mesh, with the magnetic field in the plane on the faces. This is
+    the same mode as :class:`Simulation2DMagneticField`, on the dual grid, and
+    the 2D extension of the discretization of :class:`Simulation1DElectricField`.
+
+    .. math::
+
+        \left(\mathbf{G}^\top \mathbf{M}^e_{\mu^{-1}} \mathbf{G}
+        + i \omega \mathbf{M}^n_\sigma\right) \mathbf{e} = \mathbf{q}
+
+    The source is a unit magnetic field along the top of the mesh. The bottom
+    has a Robin (downgoing plane wave) condition, and the sides have a zero
+    normal derivative of the electric field, which is exact where the columns
+    along the sides are layered.
+
+    It supports ``"yx"`` impedance, ``"xy"`` admittance and ``"zx"`` tipper
+    receivers.
+    """
+
+    _solutionType = "eSolution"
+    _formulation = "EB"
+    fieldsPair = Fields2DNodalElectricField
+
+    def __init__(self, mesh, **kwargs):
+        if mesh.dim != 2:
+            raise ValueError(
+                f"The mesh must be a 2D mesh. The provided mesh has dimension {mesh.dim}"
+            )
+
+        super().__init__(mesh, **kwargs)
+
+        for src in self.survey.source_list:
+            for rx in src.receiver_list:
+                if not (
+                    (rx.orientation == "yx" and isinstance(rx, Impedance))
+                    or (rx.orientation == "xy" and isinstance(rx, Admittance))
+                    or (rx.orientation == "zx" and isinstance(rx, Tipper))
+                ):
+                    raise TypeError(
+                        "natural_source.Simulation2DNodalElectricField supports"
+                        " Impedance and Admittance receivers for an yx orientation,"
+                        " and Tipper receivers for a zx orientation. Please provide"
+                        " a survey with valid receivers."
+                    )
+
+    @property
+    def _boundary_ops(self):
+        """Top and bottom boundary operators, lumped onto the boundary nodes.
+
+        Returns
+        -------
+        q_top : (n_nodes,) numpy.ndarray
+            The length of the top boundary shared by each node.
+        K_bot : (n_nodes, n_cells) scipy.sparse.csr_matrix
+            The length of the bottom boundary shared by each node, at the cell
+            above it.
+        """
+        if getattr(self, "_boundary_ops_cache", None) is None:
+            mesh = self.mesh
+            Pf = mesh.project_face_to_boundary_face
+            normals = mesh.boundary_face_outward_normals
+            length = Pf @ mesh.face_areas
+            to_face = (Pf @ mesh.average_node_to_face).tocsr()
+            top = normals[:, 1] > 0.5
+            bot = np.where(normals[:, 1] < -0.5)[0]
+            q_top = to_face[top].T @ length[top]
+            # the cell containing a point just inside each bottom face
+            eps = 1e-3 * min(np.min(h) for h in mesh.h)
+            inside = (Pf @ mesh.faces)[bot] - eps * normals[bot]
+            cells = np.atleast_1d(mesh.point2index(inside))
+            K = sp.csr_matrix(
+                (length[bot], (np.arange(len(bot)), cells)),
+                shape=(len(bot), mesh.n_cells),
+            )
+            K_bot = (to_face[bot].T @ K).tocsr()
+            self._boundary_ops_cache = (q_top, K_bot)
+        return self._boundary_ops_cache
+
+    def _bottom_robin_values(self):
+        sigma = np.broadcast_to(self.sigma, (self.mesh.n_cells,))
+        mui = np.broadcast_to(self.mui, (self.mesh.n_cells,))
+        return sigma, mui, np.sqrt(sigma * mui)
+
+    def getA(self, freq):
+        r"""
+        System matrix
+
+        .. math::
+
+            \mathbf{A} =
+                \mathbf{G}^\top \mathbf{M}^e_{\mu^{-1}} \mathbf{G}
+                + i \omega \mathbf{M}^n_\sigma
+                + \mathbf{R}
+
+        where :math:`\mathbf{R}` is the Robin term,
+        :math:`i \sqrt{-i \omega \sigma / \mu}` of the bottom cells, lumped onto
+        the bottom nodes.
+        """
+        G = self.mesh.nodal_gradient
+        w = omega(freq)
+        K_bot = self._boundary_ops[1]
+        robin = 1j * np.sqrt(-1j * w) * (K_bot @ self._bottom_robin_values()[2])
+        return (G.T @ self.MeMui @ G + 1j * w * self.MnSigma + sp.diags(robin)).tocsr()
+
+    def getRHS(self, freq):
+        """
+        Right hand side for a unit magnetic field along the top of the mesh.
+        """
+        return 1j * omega(freq) * self._boundary_ops[0]
+
+    def getRHSDeriv(self, freq, src, v, adjoint=False):
+        return Zero()
+
+    def _bottom_robin_deriv(self, freq, d_g, u, v, adjoint):
+        """Model derivative of the Robin term times ``u``, for ``d_g = dg/dm``."""
+        M = self._boundary_ops[1] @ d_g
+        scale = 1j * np.sqrt(-1j * omega(freq))
+        if adjoint:
+            return _inner_mat_mul_op(M, u, scale * v, adjoint=True)
+        return scale * _inner_mat_mul_op(M, u, v)
+
+    def getADeriv_sigma(self, freq, u, v, adjoint=False):
+        dA_v = 1j * omega(freq) * self.MnSigmaDeriv(u, v, adjoint=adjoint)
+        if self.sigmaMap is None:
+            return dA_v
+        sigma, _, g = self._bottom_robin_values()
+        d_g = sp.diags(0.5 * g / sigma) @ self.sigmaDeriv
+        return dA_v + self._bottom_robin_deriv(freq, d_g, u, v, adjoint)
+
+    def getADeriv_mui(self, freq, u, v, adjoint=False):
+        G = self.mesh.nodal_gradient
+        if adjoint:
+            dA_v = self.MeMuiDeriv(G @ u, G @ v, adjoint)
+        else:
+            dA_v = G.T @ self.MeMuiDeriv(G @ u, v, adjoint)
+        if self.muiMap is None:
+            return dA_v
+        _, mui, g = self._bottom_robin_values()
+        d_g = sp.diags(0.5 * g / mui) @ self.muiDeriv
+        return dA_v + self._bottom_robin_deriv(freq, d_g, u, v, adjoint)
+
+    def getADeriv(self, freq, u, v, adjoint=False):
+        return self.getADeriv_sigma(freq, u, v, adjoint) + self.getADeriv_mui(
+            freq, u, v, adjoint
+        )
 
 
 ###################################

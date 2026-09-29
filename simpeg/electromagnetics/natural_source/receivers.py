@@ -16,6 +16,18 @@ def _alpha(src):
     return 1 / (2 * np.pi * mu_0 * src.frequency)
 
 
+def _grid_2d(f, field, component="x"):
+    """Where a 2D simulation's fields store ``field``, for :meth:`getP`.
+
+    Vector fields on edges or faces give the grid of their ``component``,
+    where ``"y"`` is the vertical component of the 2D mesh.
+    """
+    location = f.aliasFields[field][1]
+    if location in ("E", "F"):
+        return location + component
+    return location
+
+
 class BaseNaturalSourceRx(BaseRx):
     """
     Base class for natural source electromagnetic receivers.
@@ -358,12 +370,8 @@ class Impedance(_ElectricAndMagneticReceiver):
                 PE = self.getP(mesh, e_loc)
                 PH = self.getP(mesh, h_loc)
             elif mesh.dim == 2:
-                if self.orientation == "xy":
-                    PE = self.getP(mesh, "Ex", 0)
-                    PH = self.getP(mesh, "CC", 1)
-                elif self.orientation == "yx":
-                    PE = self.getP(mesh, "CC", 0)
-                    PH = self.getP(mesh, "Ex", 1)
+                PE = self.getP(mesh, _grid_2d(f, "e"), 0)
+                PH = self.getP(mesh, _grid_2d(f, "h"), 1)
             top = PE @ e[:, 0]
             bot = PH @ h[:, 0]
 
@@ -408,12 +416,8 @@ class Impedance(_ElectricAndMagneticReceiver):
                 PE = self.getP(mesh, e_loc)
                 PH = self.getP(mesh, h_loc)
             elif mesh.dim == 2:
-                if self.orientation == "xy":
-                    PE = self.getP(mesh, "Ex", 0)
-                    PH = self.getP(mesh, "CC", 1)
-                elif self.orientation == "yx":
-                    PE = self.getP(mesh, "CC", 0)
-                    PH = self.getP(mesh, "Ex", 1)
+                PE = self.getP(mesh, _grid_2d(f, "e"), 0)
+                PH = self.getP(mesh, _grid_2d(f, "h"), 1)
 
             top = PE @ e[:, 0]
             bot = PH @ h[:, 0]
@@ -741,8 +745,8 @@ class Tipper(BaseNaturalSourceRx):
         # Only Tzx
         if mesh.dim == 2:
 
-            Phx = self.getP(mesh, "Ex", 1)
-            Phz = self.getP(mesh, "Ey", 0)
+            Phx = self.getP(mesh, _grid_2d(f, "h", "x"), 1)
+            Phz = self.getP(mesh, _grid_2d(f, "h", "y"), 0)
 
             hz = Phz @ h[:, 0]
             hx = Phx @ h[:, 0]
@@ -775,8 +779,8 @@ class Tipper(BaseNaturalSourceRx):
 
         if mesh.dim == 2:
 
-            Phx = self.getP(mesh, "Ex", 1)
-            Phz = self.getP(mesh, "Ey", 0)
+            Phx = self.getP(mesh, _grid_2d(f, "h", "x"), 1)
+            Phz = self.getP(mesh, _grid_2d(f, "h", "y"), 0)
 
             hz = Phz @ h[:, 0]
             hx = Phx @ h[:, 0]
@@ -1016,12 +1020,8 @@ class Admittance(_ElectricAndMagneticReceiver):
         h = f[src, "h"]
 
         if mesh.dim == 2:
-            if self.orientation == "yx":
-                PE = self.getP(mesh, "Ex", 0)
-                PH = self.getP(mesh, "CC", 1)
-            elif self.orientation == "xy":
-                PE = self.getP(mesh, "CC", 0)
-                PH = self.getP(mesh, "Ex", 1)
+            PE = self.getP(mesh, _grid_2d(f, "e"), 0)
+            PH = self.getP(mesh, _grid_2d(f, "h"), 1)
 
             top = PH @ h[:, 0]
             bot = PE @ e[:, 0]
@@ -1053,12 +1053,8 @@ class Admittance(_ElectricAndMagneticReceiver):
         h = f[src, "h"]
 
         if mesh.dim == 2:
-            if self.orientation == "yx":
-                Pe = self.getP(mesh, "Ex", 0)
-                Ph = self.getP(mesh, "CC", 1)
-            elif self.orientation == "xy":
-                Pe = self.getP(mesh, "CC", 0)
-                Ph = self.getP(mesh, "Ex", 1)
+            Pe = self.getP(mesh, _grid_2d(f, "e"), 0)
+            Ph = self.getP(mesh, _grid_2d(f, "h"), 1)
 
             top = Ph @ h[:, 0]
             bot = Pe @ e[:, 0]

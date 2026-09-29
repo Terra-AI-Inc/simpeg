@@ -16,6 +16,7 @@ Simulations
   Simulation1DPrimarySecondary
   Simulation2DElectricField
   Simulation2DMagneticField
+  Simulation2DNodalElectricField
   Simulation3DPrimarySecondary
 
 Receivers
@@ -53,6 +54,7 @@ Fields
   Fields1DPrimarySecondary
   Fields2DElectricField
   Fields2DMagneticField
+  Fields2DNodalElectricField
   Fields3DPrimarySecondary
 
 """
@@ -67,6 +69,7 @@ from .fields import (
     Fields1DPrimarySecondary,
     Fields2DElectricField,
     Fields2DMagneticField,
+    Fields2DNodalElectricField,
     Fields3DPrimarySecondary,
 )
 from .simulation import (
@@ -75,6 +78,7 @@ from .simulation import (
     Simulation1DPrimarySecondary,
     Simulation2DElectricField,
     Simulation2DMagneticField,
+    Simulation2DNodalElectricField,
     Simulation3DPrimarySecondary,
 )
 from . import sources

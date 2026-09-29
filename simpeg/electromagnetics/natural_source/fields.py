@@ -54,24 +54,28 @@ class _EField(_1DField):
     def _eDeriv_m(self, src, v, adjoint=False):
         return Zero()
 
-    def _mui(self):
+    # maps cell values of mui to where h is stored, when that is not the cells
+    _mui_average = None
+
+    def _mui_h(self):
         mui = self.simulation.mui
-        if np.ndim(mui) > 0:
-            # one value per cell, broadcast along the columns of the fields
-            mui = mui[:, None]
-        return mui
+        if np.ndim(mui) == 0:
+            return mui
+        if self._mui_average is not None:
+            mui = self._mui_average @ mui
+        return mui[:, None]
 
     def _h(self, eSolution, source_list):
         omegas = np.array([omega(src.frequency) for src in source_list])
         e = self._e(eSolution, source_list)
-        v = self._mui() * (self._C * e)
+        v = self._mui_h() * (self._C * e)
         return v / (1j * omegas)
 
     def _hDeriv_u(self, src, du_dm_v, adjoint=False):
         if du_dm_v.ndim == 1:
             du_dm_v = du_dm_v[:, None]
         om = omega(src.frequency)
-        mui = self._mui()
+        mui = self._mui_h()
         if adjoint:
             y = self._eDeriv_u(src, self._C.T * (mui * du_dm_v), adjoint=adjoint)
             return np.squeeze(y) / (1j * om)
@@ -83,6 +87,8 @@ class _EField(_1DField):
             return Zero()
         om = omega(src.frequency)
         dMui = self.simulation.muiDeriv
+        if self._mui_average is not None:
+            dMui = self._mui_average @ dMui
         e = self[src, "e"]
         if v.ndim == 1:
             v = v[:, None]
@@ -370,6 +376,31 @@ class Fields2DMagneticField(_HField, FieldsFDEM):
     def startup(self):
         # boundary conditions
         self._C = -self.simulation.mesh.edge_curl
+
+
+class Fields2DNodalElectricField(_EField, FieldsFDEM):
+    """
+    Fields of the nodal 2D electric field simulation.
+
+    The electric field, normal to the 2D plane, is on nodes, and the magnetic
+    field in the plane is on faces.
+    """
+
+    knownFields = {"eSolution": "N"}
+    aliasFields = {
+        "e": ["eSolution", "N", "_e"],
+        "h": ["eSolution", "F", "_h"],
+    }
+
+    def startup(self):
+        mesh = self.simulation.mesh
+        G = mesh.nodal_gradient
+        n_x = mesh.n_edges_x
+        # x edges sit on the y faces and y edges on the x faces, so rotating the
+        # nodal gradient gives the curl of e along the normal: h_x from de/dz on
+        # the x faces and h_z from -de/dx on the y faces
+        self._C = sp.vstack([G[n_x:], -G[:n_x]]).tocsr()
+        self._mui_average = mesh.average_cell_to_face
 
 
 ###########
