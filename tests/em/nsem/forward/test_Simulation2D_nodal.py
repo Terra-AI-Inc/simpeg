@@ -6,6 +6,8 @@ import numpy as np
 import pytest
 import discretize
 
+from scipy.constants import mu_0
+
 from simpeg import maps, tests
 from simpeg.electromagnetics import natural_source as nsem
 from simpeg.utils import get_default_solver
@@ -63,7 +65,8 @@ def padded_mesh(dx, core_x=2000.0, core_z=4000.0, distance=100e3):
     return mesh
 
 
-def test_layered_matches_1d():
+@pytest.mark.parametrize("side_boundary", ["robin", "neumann"])
+def test_layered_matches_1d(side_boundary):
     """For a layered earth it reproduces the 1D simulation's discretization."""
     h = [(50.0, 12, -1.3), (50.0, 80), (50.0, 12, 1.3)]
     mesh = discretize.TensorMesh([h, h], "CC")
@@ -74,6 +77,7 @@ def test_layered_matches_1d():
         survey=make_survey(locations, IMPEDANCE + TIPPER),
         sigma=layered(mesh.cell_centers[:, 1]),
         solver=get_default_solver(),
+        side_boundary=side_boundary,
     )
     d_2d = sim.dpred().reshape(len(FREQUENCIES), 4, len(locations))
 
@@ -145,8 +149,9 @@ def refined_tree():
     return mesh
 
 
+@pytest.mark.parametrize("side_boundary", ["robin", "neumann"])
 @pytest.mark.parametrize("mesh_type", ["tensor", "tree"])
-def test_derivatives(mesh_type):
+def test_derivatives(mesh_type, side_boundary):
     if mesh_type == "tensor":
         mesh = discretize.TensorMesh(
             [np.full(16, 100.0), np.full(64, 100.0)], origin=[-800.0, -4000.0]
@@ -160,6 +165,7 @@ def test_derivatives(mesh_type):
         survey=make_survey(locations, IMPEDANCE + TIPPER),
         sigmaMap=maps.ExpMap(mesh),
         solver=get_default_solver(),
+        side_boundary=side_boundary,
     )
     m0 = np.log(contact(mesh.cell_centers))
 
@@ -184,3 +190,110 @@ def test_invalid_receiver():
     )
     with pytest.raises(TypeError, match="Simulation2DNodalElectricField"):
         nsem.Simulation2DNodalElectricField(mesh, survey=survey)
+
+
+def contact_mesh(side, air, dx=100.0):
+    """100 m cells over the contact, padded out to ``side`` on each side, ``air``
+    above and 200 km below, with the surface at z = 0."""
+
+    def n_pad(distance):
+        width, n = dx, 0
+        while distance > 0:
+            width *= 1.3
+            distance -= width
+            n += 1
+        return n
+
+    n_below = n_pad(200e3)
+    hx = [(dx, n_pad(side), -1.3), (dx, 50), (dx, n_pad(side), 1.3)]
+    hz = [(dx, n_below, -1.3), (dx, 40), (dx, n_pad(air), 1.3)]
+    mesh = discretize.TensorMesh([hx, hz], "C0")
+    mesh.origin = np.r_[mesh.origin[0], -mesh.h[1][: n_below + 40].sum()]
+    return mesh
+
+
+def test_close_sides():
+    """With the sides only 10 km out at 0.1 Hz, the robin sides stay much closer
+    to a reference with the sides 2000 km out than the zero derivative ones."""
+    locations = np.c_[np.linspace(-2000, 2000, 9), np.zeros(9)]
+    receiver = nsem.receivers.Impedance(
+        locations, orientation="yx", component="app_res"
+    )
+    survey = nsem.Survey([nsem.sources.Planewave([receiver], 0.1)])
+
+    def app_res(mesh, side_boundary):
+        return nsem.Simulation2DNodalElectricField(
+            mesh,
+            survey=survey,
+            sigma=contact(mesh.cell_centers),
+            solver=get_default_solver(),
+            side_boundary=side_boundary,
+        ).dpred()
+
+    reference = app_res(contact_mesh(2000e3, 2000e3), "neumann")
+    mesh = contact_mesh(10e3, 10e3)
+    error = {
+        side: np.max(np.abs(app_res(mesh, side) / reference - 1))
+        for side in ("robin", "neumann")
+    }
+    assert error["robin"] < 0.2 * error["neumann"]
+    assert error["robin"] < 0.015
+
+
+@pytest.mark.parametrize("prop", ["sigma", "mui"])
+def test_boundary_derivatives(prop):
+    """The robin sides depend on the model through the system matrix and, with
+    the side columns, through the right hand side."""
+    mesh = refined_tree()
+    sigma = contact(mesh.cell_centers)
+    kwargs = {f"{prop}Map": maps.ExpMap(mesh)}
+    if prop == "sigma":
+        m0 = np.log(sigma)
+    else:
+        kwargs["sigma"] = sigma
+        m0 = np.full(mesh.n_cells, -np.log(mu_0))
+    rng = np.random.default_rng(7)
+    m0 = m0 + 0.05 * rng.normal(size=mesh.n_cells)
+    survey = make_survey(np.array([[0.0, 0.0]]), IMPEDANCE)
+    sim = nsem.Simulation2DNodalElectricField(
+        mesh, survey=survey, solver=get_default_solver(), **kwargs
+    )
+    src = survey.source_list[0]
+    freq = src.frequency
+    u = rng.normal(size=mesh.n_nodes) + 1j * rng.normal(size=mesh.n_nodes)
+
+    def system(m):
+        sim.model = m
+        return sim.getA(freq) @ u, lambda v: sim.getADeriv(freq, u, v)
+
+    def rhs(m):
+        sim.model = m
+        return sim.getRHS(freq), lambda v: sim.getRHSDeriv(freq, src, v)
+
+    for fun in (system, rhs):
+        assert tests.check_derivative(fun, m0, num=3, plotIt=False, random_seed=7)
+
+    sim.model = m0
+    A = sim.getA(freq)
+    assert abs(A - A.T).max() <= 1e-12 * abs(A).max()
+    v = rng.normal(size=m0.size)
+    w = rng.normal(size=mesh.n_nodes) + 1j * rng.normal(size=mesh.n_nodes)
+    np.testing.assert_allclose(
+        w @ sim.getADeriv(freq, u, v),
+        v @ sim.getADeriv(freq, u, w, adjoint=True),
+        rtol=1e-10,
+    )
+    np.testing.assert_allclose(
+        w @ sim.getRHSDeriv(freq, src, v),
+        v @ sim.getRHSDeriv(freq, src, w, adjoint=True),
+        rtol=1e-8,
+    )
+
+
+def test_invalid_side_boundary():
+    mesh = discretize.TensorMesh([np.full(8, 100.0), np.full(8, 100.0)], "CC")
+    survey = make_survey(np.array([[0.0, 0.0]]), IMPEDANCE)
+    with pytest.raises(ValueError, match="side_boundary"):
+        nsem.Simulation2DNodalElectricField(
+            mesh, survey=survey, side_boundary="dirichlet"
+        )

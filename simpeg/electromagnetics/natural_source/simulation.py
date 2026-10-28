@@ -1136,7 +1136,7 @@ class Simulation2DMagneticField(_RobinBoundary2D, BaseFDEMSimulation):
         return items
 
 
-class Simulation2DNodalElectricField(BaseFDEMSimulation):
+class Simulation2DNodalElectricField(_RobinBoundary2D, BaseFDEMSimulation):
     r"""2D natural source simulation with the electric field on nodes.
 
     Solves for the electric field normal to the 2D plane, :math:`E_y`, on the
@@ -1149,26 +1149,38 @@ class Simulation2DNodalElectricField(BaseFDEMSimulation):
         \left(\mathbf{G}^\top \mathbf{M}^e_{\mu^{-1}} \mathbf{G}
         + i \omega \mathbf{M}^n_\sigma\right) \mathbf{e} = \mathbf{q}
 
-    The source is a unit magnetic field along the top of the mesh. The bottom
-    has a Robin (downgoing plane wave) condition, and the sides have a zero
-    normal derivative of the electric field, which is exact where the columns
-    along the sides are layered.
+    The magnetic field is the natural boundary condition of this formulation, so
+    every boundary condition enters through it. The top has a unit magnetic field,
+    the sides take their electric field from 1D columns of the side cells, and the
+    bottom has a Robin (downgoing plane wave) condition, as in
+    :class:`Simulation2DElectricField`. Unlike in that mode, the magnetic field is
+    not exactly constant through the air here, so the top needs to sit well above
+    the surface.
 
     It supports ``"yx"`` impedance, ``"xy"`` admittance and ``"zx"`` tipper
     receivers.
+
+    Parameters
+    ----------
+    mesh : discretize.TensorMesh or discretize.TreeMesh
+        A 2D mesh.
+    side_boundary : {"robin", "neumann"}, default: "robin"
+        Condition on the sides of the mesh (see :attr:`side_boundary`).
     """
 
     _solutionType = "eSolution"
     _formulation = "EB"
     fieldsPair = Fields2DNodalElectricField
+    _robin_properties = ("sigma", "mui")
 
-    def __init__(self, mesh, **kwargs):
+    def __init__(self, mesh, side_boundary="robin", **kwargs):
         if mesh.dim != 2:
             raise ValueError(
                 f"The mesh must be a 2D mesh. The provided mesh has dimension {mesh.dim}"
             )
 
         super().__init__(mesh, **kwargs)
+        self.side_boundary = side_boundary
 
         for src in self.survey.source_list:
             for rx in src.receiver_list:
@@ -1184,43 +1196,88 @@ class Simulation2DNodalElectricField(BaseFDEMSimulation):
                         " a survey with valid receivers."
                     )
 
-    @property
-    def _boundary_ops(self):
-        """Top and bottom boundary operators, lumped onto the boundary nodes.
-
-        Returns
-        -------
-        q_top : (n_nodes,) numpy.ndarray
-            The length of the top boundary shared by each node.
-        K_bot : (n_nodes, n_cells) scipy.sparse.csr_matrix
-            The length of the bottom boundary shared by each node, at the cell
-            above it.
-        """
-        if getattr(self, "_boundary_ops_cache", None) is None:
-            mesh = self.mesh
-            Pf = mesh.project_face_to_boundary_face
-            normals = mesh.boundary_face_outward_normals
-            length = Pf @ mesh.face_areas
-            to_face = (Pf @ mesh.average_node_to_face).tocsr()
-            top = normals[:, 1] > 0.5
-            bot = np.where(normals[:, 1] < -0.5)[0]
-            q_top = to_face[top].T @ length[top]
-            # the cell containing a point just inside each bottom face
-            eps = 1e-3 * min(np.min(h) for h in mesh.h)
-            inside = (Pf @ mesh.faces)[bot] - eps * normals[bot]
-            cells = np.atleast_1d(mesh.point2index(inside))
-            K = sp.csr_matrix(
-                (length[bot], (np.arange(len(bot)), cells)),
-                shape=(len(bot), mesh.n_cells),
+        # 1D columns of the side cells, on the side nodes
+        frequencies = self.survey.frequencies
+        survey = Survey([Planewave([], freq) for freq in frequencies])
+        sims = []
+        for side in ("left", "right"):
+            nodes, cells, lengths = self._boundary_pieces[side]
+            P = maps.Projection(mesh.n_cells, cells)
+            map_kwargs = {}
+            if self.sigmaMap is not None:
+                map_kwargs["sigmaMap"] = P * self.sigmaMap
+            if self.muiMap is not None:
+                map_kwargs["muiMap"] = P * self.muiMap
+            sims.append(
+                Simulation1DElectricField(
+                    TensorMesh((lengths,), (mesh.nodes[nodes[0], 1],)),
+                    survey=survey,
+                    solver=self.solver,
+                    **map_kwargs,
+                )
             )
-            K_bot = (to_face[bot].T @ K).tocsr()
-            self._boundary_ops_cache = (q_top, K_bot)
-        return self._boundary_ops_cache
+        self._sim_left, self._sim_right = sims
 
-    def _bottom_robin_values(self):
-        sigma = np.broadcast_to(self.sigma, (self.mesh.n_cells,))
-        mui = np.broadcast_to(self.mui, (self.mesh.n_cells,))
-        return sigma, mui, np.sqrt(sigma * mui)
+    @property
+    def _boundary_pieces(self):
+        """The nodes along each side of the mesh, sorted, with the cell inside
+        and the length of each interval between consecutive nodes."""
+        if getattr(self, "_boundary_pieces_cache", None) is None:
+            mesh = self.mesh
+            nodes = mesh.nodes
+            eps = 1e-3 * min(np.min(h) for h in mesh.h)
+            pieces = {}
+            for name, axis, value, inward in (
+                ("bottom", 1, mesh.nodes_y[0], (0.0, 1.0)),
+                ("top", 1, mesh.nodes_y[-1], (0.0, -1.0)),
+                ("left", 0, mesh.nodes_x[0], (1.0, 0.0)),
+                ("right", 0, mesh.nodes_x[-1], (-1.0, 0.0)),
+            ):
+                # exact comparisons, as the boundary nodes sit on the outer nodes
+                on = np.where(nodes[:, axis] == value)[0]
+                along = nodes[on, 1 - axis]
+                on = on[np.argsort(along)]
+                ends = nodes[on]
+                inside = 0.5 * (ends[1:] + ends[:-1]) + eps * np.asarray(inward)
+                cells = np.atleast_1d(mesh.point2index(inside))
+                lengths = np.diff(np.sort(along))
+                pieces[name] = (on, cells, lengths)
+            self._boundary_pieces_cache = pieces
+        return self._boundary_pieces_cache
+
+    def _make_robin_ops(self):
+        # each interval puts half its length on each of its two nodes
+        names = ["bottom"]
+        if self.side_boundary == "robin":
+            names += ["left", "right"]
+        rows_n, rows_c, rows_l, is_side = [], [], [], []
+        for name in names:
+            nodes, cells, lengths = self._boundary_pieces[name]
+            for end in (nodes[:-1], nodes[1:]):
+                rows_n.append(end)
+                rows_c.append(cells)
+                rows_l.append(lengths / 2)
+                is_side.append(np.full(len(cells), name != "bottom"))
+        rows_n, rows_c = np.concatenate(rows_n), np.concatenate(rows_c)
+        rows_l = np.concatenate(rows_l)
+        self._robin_is_side = np.concatenate(is_side)
+        n = len(rows_n)
+        P = sp.csr_matrix(
+            (np.ones(n), (np.arange(n), rows_n)), shape=(n, self.mesh.n_nodes)
+        )
+        K = sp.csr_matrix(
+            (rows_l, (np.arange(n), rows_c)), shape=(n, self.mesh.n_cells)
+        )
+        return P, K
+
+    @property
+    def _top_share(self):
+        """The top nodes, and the length of the top shared by each."""
+        if getattr(self, "_top_share_cache", None) is None:
+            nodes, _, lengths = self._boundary_pieces["top"]
+            share = np.r_[lengths, 0.0] / 2 + np.r_[0.0, lengths] / 2
+            self._top_share_cache = (nodes, share)
+        return self._top_share_cache
 
     def getA(self, freq):
         r"""
@@ -1233,40 +1290,80 @@ class Simulation2DNodalElectricField(BaseFDEMSimulation):
                 + i \omega \mathbf{M}^n_\sigma
                 + \mathbf{R}
 
-        where :math:`\mathbf{R}` is the Robin term,
-        :math:`i \sqrt{-i \omega \sigma / \mu}` of the bottom cells, lumped onto
-        the bottom nodes.
+        where :math:`\mathbf{R}` is the Robin term on the bottom (and side)
+        boundary nodes.
         """
         G = self.mesh.nodal_gradient
-        w = omega(freq)
-        K_bot = self._boundary_ops[1]
-        robin = 1j * np.sqrt(-1j * w) * (K_bot @ self._bottom_robin_values()[2])
-        return (G.T @ self.MeMui @ G + 1j * w * self.MnSigma + sp.diags(robin)).tocsr()
+        A = G.T @ self.MeMui @ G + 1j * omega(freq) * self.MnSigma
+        return (A + self._robin_matrix(freq)).tocsr()
+
+    def _side_data(self, freq):
+        """The 1D columns' electric field on the side nodes (zero elsewhere)."""
+        src = self._sim_left.survey.get_sources_by_frequency(freq)[0]
+        e = np.zeros(self.mesh.n_nodes, dtype=complex)
+        for f, side in zip(self.boundary_fields(), ("left", "right")):
+            e[self._boundary_pieces[side][0]] = f[src, "e"][:, 0]
+        return e
 
     def getRHS(self, freq):
         """
-        Right hand side for a unit magnetic field along the top of the mesh.
+        Right hand side for a unit magnetic field along the top, and the 1D
+        columns along the sides (with the robin sides).
         """
-        return 1j * omega(freq) * self._boundary_ops[0]
+        nodes, share = self._top_share
+        rhs = np.zeros(self.mesh.n_nodes, dtype=complex)
+        rhs[nodes] = 1j * omega(freq) * share
+        if self.side_boundary == "robin":
+            P, K = self._robin_ops
+            coef = self._robin_is_side * (K @ self._robin_coefficient(freq))
+            rhs = rhs + P.T @ (coef * (P @ self._side_data(freq)))
+        return rhs
 
     def getRHSDeriv(self, freq, src, v, adjoint=False):
-        return Zero()
-
-    def _bottom_robin_deriv(self, freq, d_g, u, v, adjoint):
-        """Model derivative of the Robin term times ``u``, for ``d_g = dg/dm``."""
-        M = self._boundary_ops[1] @ d_g
-        scale = 1j * np.sqrt(-1j * omega(freq))
-        if adjoint:
-            return _inner_mat_mul_op(M, u, scale * v, adjoint=True)
-        return scale * _inner_mat_mul_op(M, u, v)
+        if self.side_boundary != "robin":
+            return Zero()
+        P, K = self._robin_ops
+        is_side = self._robin_is_side
+        coef = is_side * (K @ self._robin_coefficient(freq))
+        e_rows = is_side * (P @ self._side_data(freq))
+        src_1d = self._sim_left.survey.get_sources_by_frequency(freq)[0]
+        sides = list(zip(self.boundary_fields(), ("left", "right")))
+        if not adjoint:
+            de = np.zeros(self.mesh.n_nodes, dtype=complex)
+            for f, side in sides:
+                de[self._boundary_pieces[side][0]] = np.ravel(
+                    f.field_deriv_m("e", freq, src_1d, v, adjoint=False)
+                )
+            out = P.T @ (coef * (P @ de))
+            for name in self._robin_properties:
+                if getattr(self, f"{name}Map") is not None:
+                    d_coef = (
+                        0.5 * self._robin_coefficient(freq) / self._robin_property(name)
+                    )
+                    dK = K @ sp.diags(d_coef) @ getattr(self, f"{name}Deriv")
+                    out = out + P.T @ (e_rows * (dK @ v))
+            return out
+        y = P @ np.ravel(v)
+        w = P.T @ (coef * y)
+        out = 0
+        for f, side in sides:
+            out = out + np.ravel(
+                f.field_deriv_m(
+                    "e", freq, src_1d, w[self._boundary_pieces[side][0]], adjoint=True
+                )
+            )
+        for name in self._robin_properties:
+            if getattr(self, f"{name}Map") is not None:
+                d_coef = (
+                    0.5 * self._robin_coefficient(freq) / self._robin_property(name)
+                )
+                dK = K @ sp.diags(d_coef) @ getattr(self, f"{name}Deriv")
+                out = out + dK.T @ (e_rows * y)
+        return out
 
     def getADeriv_sigma(self, freq, u, v, adjoint=False):
         dA_v = 1j * omega(freq) * self.MnSigmaDeriv(u, v, adjoint=adjoint)
-        if self.sigmaMap is None:
-            return dA_v
-        sigma, _, g = self._bottom_robin_values()
-        d_g = sp.diags(0.5 * g / sigma) @ self.sigmaDeriv
-        return dA_v + self._bottom_robin_deriv(freq, d_g, u, v, adjoint)
+        return dA_v + self._robin_deriv(freq, "sigma", u, v, adjoint)
 
     def getADeriv_mui(self, freq, u, v, adjoint=False):
         G = self.mesh.nodal_gradient
@@ -1274,16 +1371,34 @@ class Simulation2DNodalElectricField(BaseFDEMSimulation):
             dA_v = self.MeMuiDeriv(G @ u, G @ v, adjoint)
         else:
             dA_v = G.T @ self.MeMuiDeriv(G @ u, v, adjoint)
-        if self.muiMap is None:
-            return dA_v
-        _, mui, g = self._bottom_robin_values()
-        d_g = sp.diags(0.5 * g / mui) @ self.muiDeriv
-        return dA_v + self._bottom_robin_deriv(freq, d_g, u, v, adjoint)
+        return dA_v + self._robin_deriv(freq, "mui", u, v, adjoint)
 
     def getADeriv(self, freq, u, v, adjoint=False):
         return self.getADeriv_sigma(freq, u, v, adjoint) + self.getADeriv_mui(
             freq, u, v, adjoint
         )
+
+    def boundary_fields(self, model=None):
+        "Returns the 1D field objects at the boundaries"
+        if getattr(self, "_boundary_fields", None) is None:
+            if model is None:
+                model = self.model
+            fields = []
+            for sim, side in ((self._sim_left, "left"), (self._sim_right, "right")):
+                cells = self._boundary_pieces[side][1]
+                if self.sigmaMap is None:
+                    sim.sigma = self._robin_property("sigma")[cells]
+                if self.muiMap is None:
+                    sim.mui = self._robin_property("mui")[cells]
+                fields.append(sim.fields(model))
+            self._boundary_fields = tuple(fields)
+        return self._boundary_fields
+
+    @property
+    def _delete_on_model_update(self):
+        items = super()._delete_on_model_update
+        items.append("_boundary_fields")
+        return items
 
 
 ###################################
