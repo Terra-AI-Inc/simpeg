@@ -133,3 +133,15 @@ def test_model_without_map_raises(sim_class):
     sim = sim_class(mesh, survey=survey, sigma=sigma, eta=eta)
     with pytest.raises(ValueError, match="no active mappings"):
         sim.dpred(eta)
+
+
+@pytest.mark.parametrize("sim_class", SIMULATIONS)
+def test_dpred_with_fields_uses_given_model(sim_class):
+    """``dpred(m, f=f)`` predicts data for ``m``, whatever model built ``f``."""
+    mesh, survey, sigma, eta = build_problem(sim_class)
+    sim = sim_class(mesh, survey=survey, sigma=sigma, etaMap=maps.IdentityMap())
+
+    f = sim.fields(eta)
+    d_2eta = sim.dpred(2 * eta, f=f)
+    np.testing.assert_allclose(d_2eta, 2 * sim.dpred(eta, f=f), rtol=1e-10)
+    np.testing.assert_allclose(d_2eta, sim.dpred(2 * eta), rtol=1e-10)

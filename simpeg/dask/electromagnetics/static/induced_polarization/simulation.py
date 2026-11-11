@@ -12,7 +12,7 @@ def dask_getJ(self, m, f=None):
     """
     self.model = m
     if f is None:
-        f = self._dc_fields()
+        f = self.fields()
     J_eta = self._getJ_eta(f)
     eta_deriv = self.etaDeriv
     if isinstance(eta_deriv, Zero):

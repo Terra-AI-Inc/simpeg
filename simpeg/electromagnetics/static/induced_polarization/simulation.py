@@ -57,17 +57,11 @@ class BaseIPSimulation(BasePDESimulation):
         # The DC sensitivities are taken with respect to eta on every cell.
         return self.mesh.n_cells
 
-    def _dc_fields(self):
-        if self._f is None:
-            # re-uses the DC simulation's fields method
-            self._f = super().fields(None)
-        return self._f
-
     @cached_property
     def _scale(self):
         survey_slices = self.survey.get_all_slices()
         scale = np.ones(self.survey.nD)
-        f = self._dc_fields()
+        f = self.fields()
         try:
             f = self.fields_to_space(f)
         except AttributeError:
@@ -104,31 +98,22 @@ class BaseIPSimulation(BasePDESimulation):
         self._f = _f
 
     _Jmatrix = None
-    _pred = None
 
-    def fields(self, m):
-        if self.verbose:
-            print(">> Compute DC fields")
-        self._dc_fields()
-
-        self._pred = self.forward(m, f=self._f)
-
+    def fields(self, m=None):
+        if m is not None:
+            self.model = m
+        # The DC fields only depend on the background conductivity, so they
+        # are computed once and reused for every model.
+        if self._f is None:
+            if self.verbose:
+                print(">> Compute DC fields")
+            self._f = super().fields(None)
         return self._f
 
     def dpred(self, m=None, f=None):
-        r"""
-        Predicted data.
-
-        .. math::
-
-            d_\text{pred} = Pf(m)
-
-        """
-        # return self.Jvec(m, m, f=f)
         if f is None:
             f = self.fields(m)
-
-        return self._pred
+        return self.forward(m, f=f)
 
     def getJtJdiag(self, m, W=None, f=None):
         if getattr(self, "_gtgdiag", None) is None:
@@ -160,7 +145,7 @@ class BaseIPSimulation(BasePDESimulation):
     def getJ(self, m, f=None):
         self.model = m
         if f is None:
-            f = self._dc_fields()
+            f = self.fields()
         J_eta = self._getJ_eta(f)
         eta_deriv = self.etaDeriv
         if isinstance(eta_deriv, Zero):
@@ -175,13 +160,13 @@ class BaseIPSimulation(BasePDESimulation):
         if isinstance(eta_deriv_v, Zero):
             return np.zeros(self.survey.nD)
         if f is None:
-            f = self._dc_fields()
+            f = self.fields()
         return self._scale * self._Jvec_eta(eta_deriv_v, f)
 
     def forward(self, m, f=None):
         self.model = m
         if f is None:
-            f = self._dc_fields()
+            f = self.fields()
         eta = self.eta * np.ones(self.mesh.n_cells)
         return self._scale * self._Jvec_eta(eta, f)
 
@@ -191,7 +176,7 @@ class BaseIPSimulation(BasePDESimulation):
         if isinstance(eta_deriv, Zero):
             return Zero()
         if f is None:
-            f = self._dc_fields()
+            f = self.fields()
         return eta_deriv.T @ self._Jtvec_eta(v * self._scale, f)
 
     @property
