@@ -806,5 +806,16 @@ class Simulation2DNodal(BaseDCSimulation2D):
             AvgCC2Fb = sdiag(alpha * (P_bf @ self.mesh.face_areas)) @ AvgCC2Fb
             self._AvgBC[ky] = AvgN2Fb.T @ AvgCC2Fb
 
+    @property
+    def _clear_on_sigma_update(self):
+        """Add items to be cleared upon updating the `sigma` property.
+
+        Returns
+        -------
+        list
+            All of the items to be cleared up updating the `sigma` property.
+        """
+        return super()._clear_on_sigma_update + ["_MBC_sigma"]
+
 
 Simulation2DCellCentred = Simulation2DCellCentered  # UK and US

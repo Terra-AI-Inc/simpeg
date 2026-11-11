@@ -137,3 +137,24 @@ class DCProblemTestsN_Robin_storeJ(DCProblem_2DTests):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_nodal_boundary_deriv_cleared_on_model_update():
+    """The cached Robin boundary derivative follows a non-linear sigmaMap."""
+    mesh = discretize.TensorMesh(
+        [[(10.0, 5, -1.3), (10.0, 20), (10.0, 5, 1.3)], [(10.0, 5, -1.3), (10.0, 10)]],
+        "CN",
+    )
+    x = np.linspace(-60.0, 60.0, 7)
+    rx = dc.receivers.Dipole(np.c_[x - 10.0, 0 * x], np.c_[x + 10.0, 0 * x])
+    src = dc.sources.Dipole([rx], np.r_[-90.0, 0.0], np.r_[90.0, 0.0])
+    survey = dc.Survey([src])
+
+    m0 = np.full(mesh.n_cells, np.log(1e-2))
+    m1 = m0 + np.linspace(-1, 1, mesh.n_cells)
+    v = np.random.default_rng(seed=11).uniform(size=mesh.n_cells)
+
+    sim = dc.Simulation2DNodal(mesh, survey=survey, sigmaMap=maps.ExpMap())
+    sim.Jvec(m0, v)
+    sim_fresh = dc.Simulation2DNodal(mesh, survey=survey, sigmaMap=maps.ExpMap())
+    np.testing.assert_allclose(sim.Jvec(m1, v), sim_fresh.Jvec(m1, v), rtol=1e-8)

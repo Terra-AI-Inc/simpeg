@@ -145,3 +145,59 @@ def test_dpred_with_fields_uses_given_model(sim_class):
     d_2eta = sim.dpred(2 * eta, f=f)
     np.testing.assert_allclose(d_2eta, 2 * sim.dpred(eta, f=f), rtol=1e-10)
     np.testing.assert_allclose(d_2eta, sim.dpred(2 * eta), rtol=1e-10)
+
+
+@pytest.mark.parametrize("sim_class", SIMULATIONS)
+@pytest.mark.parametrize("store_J", [False, True])
+@pytest.mark.parametrize("prop", ["sigma", "rho"])
+def test_changing_conductivity_clears_cache(sim_class, store_J, prop):
+    """Setting `sigma` or `rho` after a run matches a new simulation."""
+    mesh, survey, sigma, eta = build_problem(sim_class, "apparent_chargeability")
+    sigma_new = sigma.copy()
+    sigma_new[: mesh.n_cells // 2] *= 10.0
+
+    sim = sim_class(mesh, survey=survey, sigma=sigma, eta=eta, storeJ=store_J)
+    d_old = sim.dpred()
+    setattr(sim, prop, sigma_new if prop == "sigma" else 1.0 / sigma_new)
+    d_new = sim.dpred()
+
+    sim_fresh = sim_class(mesh, survey=survey, sigma=sigma_new, eta=eta)
+    assert not np.allclose(d_new, d_old)
+    np.testing.assert_allclose(d_new, sim_fresh.dpred(), rtol=1e-8)
+
+    # and the sensitivities of a mapped simulation
+    sim = sim_class(
+        mesh, survey=survey, sigma=sigma, etaMap=maps.ExpMap(), storeJ=store_J
+    )
+    m0 = np.log(eta)
+    v = np.random.default_rng(seed=3).uniform(size=m0.size)
+    sim.Jvec(m0, v)
+    sim.getJtJdiag(m0)
+    setattr(sim, prop, sigma_new if prop == "sigma" else 1.0 / sigma_new)
+
+    sim_fresh = sim_class(
+        mesh, survey=survey, sigma=sigma_new, etaMap=maps.ExpMap(), storeJ=store_J
+    )
+    np.testing.assert_allclose(sim.Jvec(m0, v), sim_fresh.Jvec(m0, v), rtol=1e-8)
+    np.testing.assert_allclose(sim.getJtJdiag(m0), sim_fresh.getJtJdiag(m0), rtol=1e-8)
+
+
+@pytest.mark.parametrize("sim_class", SIMULATIONS)
+def test_shared_dc_solver_untouched(sim_class):
+    """Changing the IP conductivity leaves a DC simulation's shared `Ainv` alone."""
+    mesh, survey, sigma, eta = build_problem(sim_class)
+    dc_class = getattr(dc, sim_class.__name__)
+    dc_survey = dc.Survey(survey.source_list)
+    sim_dc = dc_class(mesh, survey=dc_survey, sigmaMap=maps.ExpMap())
+    m_dc = np.log(sigma)
+    f_dc = sim_dc.fields(m_dc)
+    v = np.random.default_rng(seed=5).uniform(size=m_dc.size)
+    Jv_dc = sim_dc.Jvec(m_dc, v, f=f_dc)
+
+    # without `_f`, the IP simulation computes its own DC fields
+    sim_ip = sim_class(mesh, survey=survey, sigma=sigma, eta=eta, Ainv=sim_dc.Ainv)
+    sim_ip.dpred()
+    sim_ip.sigma = 10 * sigma
+    sim_ip.dpred()
+
+    np.testing.assert_allclose(sim_dc.Jvec(m_dc, v, f=f_dc), Jv_dc, rtol=1e-10)

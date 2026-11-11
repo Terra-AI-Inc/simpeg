@@ -97,16 +97,43 @@ class BaseIPSimulation(BasePDESimulation):
             self.Ainv = Ainv
         self._f = _f
 
+    _f = None
     _Jmatrix = None
+
+    # Everything cached here depends on the background conductivity (not on eta),
+    # so it is kept across model updates, and cleared when `sigma` or `rho` is set.
+    @property
+    def _clear_on_sigma_update(self):
+        return super()._clear_on_sigma_update + [
+            "_f",
+            "_Jmatrix",
+            "_gtgdiag",
+            "_scale",
+        ]
+
+    @property
+    def _clear_on_rho_update(self):
+        return super()._clear_on_rho_update + [
+            "_f",
+            "_Jmatrix",
+            "_gtgdiag",
+            "_scale",
+        ]
 
     def fields(self, m=None):
         if m is not None:
             self.model = m
-        # The DC fields only depend on the background conductivity, so they
-        # are computed once and reused for every model.
+        # computed once, the DC fields only depend on the background conductivity
         if self._f is None:
             if self.verbose:
                 print(">> Compute DC fields")
+            # start from a new factorization, the DC fields method would otherwise
+            # clean (or in 2D, overwrite) an `Ainv` that could be shared with the DC
+            # simulation it came from.
+            if isinstance(self.Ainv, list):
+                self.Ainv = [None] * len(self.Ainv)
+            else:
+                self.Ainv = None
             self._f = super().fields(None)
         return self._f
 
@@ -128,8 +155,7 @@ class BaseIPSimulation(BasePDESimulation):
         return self._gtgdiag
 
     def _getJ_eta(self, f):
-        # Sensitivity of the unscaled data with respect to eta. It only depends
-        # on the background conductivity, so it stays valid across model updates.
+        # Sensitivity of the unscaled data with respect to eta (cached in `_Jmatrix`)
         return super().getJ(self.model, f=f)
 
     def _Jvec_eta(self, v, f):

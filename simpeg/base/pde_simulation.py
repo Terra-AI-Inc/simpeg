@@ -855,7 +855,9 @@ class BaseElectricalPDESimulation(BasePDESimulation):
         super().__setattr__(name, value)
         if name in ["sigma", "rho"]:
             for mat in self._clear_on_sigma_update + self._clear_on_rho_update:
-                if hasattr(self, mat):
+                # check the instance dict, `hasattr` would evaluate cached properties
+                # and is True for class level defaults that can't be deleted.
+                if mat in vars(self):
                     delattr(self, mat)
 
 
