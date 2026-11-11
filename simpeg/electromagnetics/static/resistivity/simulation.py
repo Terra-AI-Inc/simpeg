@@ -346,10 +346,10 @@ class BaseDCSimulation(BaseElectricalPDESimulation):
             if isinstance(v, Data):
                 v = v.dobs
             v = self._mini_survey_dataT(v)
-            Jtv = np.zeros(m.size)
+            Jtv = np.zeros(self._n_sensitivity_params)
         else:
             # This is for forming full sensitivity matrix
-            Jtv = np.zeros((self.model.size, survey.nD), order="F")
+            Jtv = np.zeros((self._n_sensitivity_params, survey.nD), order="F")
             istrt = int(0)
             iend = int(0)
 
@@ -434,6 +434,11 @@ class BaseDCSimulation(BaseElectricalPDESimulation):
         """
         toDelete = super()._delete_on_model_update
         return toDelete + ["_Jmatrix", "_gtgdiag"]
+
+    @property
+    def _n_sensitivity_params(self):
+        """Number of columns in the sensitivity matrix."""
+        return self.model.size
 
     def _mini_survey_data(self, d_mini):
         """Get mini survey data."""

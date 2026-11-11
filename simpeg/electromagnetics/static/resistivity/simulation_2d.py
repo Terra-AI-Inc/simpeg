@@ -366,7 +366,7 @@ class BaseDCSimulation2D(BaseElectricalPDESimulation):
             if isinstance(v, Data):
                 v = v.dobs
             v = self._mini_survey_dataT(v)
-            Jtv = np.zeros(m.size, dtype=float)
+            Jtv = np.zeros(self._n_sensitivity_params, dtype=float)
 
             # Get dict of flat array slices for each source-receiver pair in the survey
             survey_slices = survey.get_all_slices()
@@ -398,7 +398,7 @@ class BaseDCSimulation2D(BaseElectricalPDESimulation):
 
         else:
             # This is for forming full sensitivity matrix
-            Jt = np.zeros((self.model.size, survey.nD), order="F")
+            Jt = np.zeros((self._n_sensitivity_params, survey.nD), order="F")
             for iky, ky in enumerate(kys):
                 u_ky = f[:, self._solutionType, iky]
                 istrt = 0
@@ -453,6 +453,11 @@ class BaseDCSimulation2D(BaseElectricalPDESimulation):
         if self.fix_Jmatrix:
             return toDelete
         return toDelete + ["_Jmatrix"]
+
+    @property
+    def _n_sensitivity_params(self):
+        """Number of columns in the sensitivity matrix."""
+        return self.model.size
 
     def _mini_survey_data(self, d_mini):
         if self._mini_survey is not None:

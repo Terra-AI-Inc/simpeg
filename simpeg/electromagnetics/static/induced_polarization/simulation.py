@@ -5,7 +5,7 @@ import scipy.sparse as sp
 
 from .... import maps, props
 from ....base import BasePDESimulation
-from ....utils import mkvc
+from ....utils import Identity, Zero, mkvc
 from ..resistivity import Simulation2DCellCentered as DC_2D_CC
 from ..resistivity import Simulation2DNodal as DC_2D_N
 from ..resistivity import Simulation3DCellCentered as DC_3D_CC
@@ -13,6 +13,14 @@ from ..resistivity import Simulation3DNodal as DC_3D_N
 
 
 class BaseIPSimulation(BasePDESimulation):
+    """Base class for linearized induced polarization simulations.
+
+    The predicted data are the sensitivity of the DC data with respect to
+    chargeability, multiplied by the chargeability. The chargeability can be given
+    directly with `eta` (then call `dpred` without a model), or as a function of the
+    inversion model with `etaMap`.
+    """
+
     sigma = props.PhysicalProperty("Electrical Conductivity (S/m)")
     rho = props.PhysicalProperty("Electrical Resistivity (Ohm m)")
     props.Reciprocal(sigma, rho)
@@ -33,25 +41,37 @@ class BaseIPSimulation(BasePDESimulation):
     def rhoMap(self, arg):
         pass
 
+    # The DC machinery (``getADeriv``, ``_Jtvec``, ...) works with respect to eta
+    # through these two derivatives. The derivative of eta with respect to the
+    # inversion model is applied separately in ``Jvec``, ``Jtvec`` and ``getJ``.
     @property
     def sigmaDeriv(self):
-        return -sp.diags(self.sigma) @ self.etaDeriv
+        return -sp.diags(self.sigma * np.ones(self.mesh.n_cells))
 
     @property
     def rhoDeriv(self):
-        return sp.diags(self.rho) @ self.etaDeriv
+        return sp.diags(self.rho * np.ones(self.mesh.n_cells))
+
+    @property
+    def _n_sensitivity_params(self):
+        # The DC sensitivities are taken with respect to eta on every cell.
+        return self.mesh.n_cells
+
+    def _dc_fields(self):
+        if self._f is None:
+            # re-uses the DC simulation's fields method
+            self._f = super().fields(None)
+        return self._f
 
     @cached_property
     def _scale(self):
         survey_slices = self.survey.get_all_slices()
         scale = np.ones(self.survey.nD)
-        if self._f is None:
-            # re-uses the DC simulation's fields method
-            self._f = super().fields(None)
+        f = self._dc_fields()
         try:
-            f = self.fields_to_space(self._f)
+            f = self.fields_to_space(f)
         except AttributeError:
-            f = self._f
+            pass
         # loop through receivers to check if they need to set the _dc_voltage
         for src in self.survey.source_list:
             for rx in src.receiver_list:
@@ -89,9 +109,7 @@ class BaseIPSimulation(BasePDESimulation):
     def fields(self, m):
         if self.verbose:
             print(">> Compute DC fields")
-        if self._f is None:
-            # re-uses the DC simulation's fields method
-            self._f = super().fields(None)
+        self._dc_fields()
 
         self._pred = self.forward(m, f=self._f)
 
@@ -124,14 +142,57 @@ class BaseIPSimulation(BasePDESimulation):
 
         return self._gtgdiag
 
+    def _getJ_eta(self, f):
+        # Sensitivity of the unscaled data with respect to eta. It only depends
+        # on the background conductivity, so it stays valid across model updates.
+        return super().getJ(self.model, f=f)
+
+    def _Jvec_eta(self, v, f):
+        if self.storeJ:
+            return np.asarray(self._getJ_eta(f) @ v)
+        return super().Jvec(self.model, v, f=f)
+
+    def _Jtvec_eta(self, v, f):
+        if self.storeJ:
+            return np.asarray(self._getJ_eta(f).T @ v)
+        return super().Jtvec(self.model, v, f=f)
+
+    def getJ(self, m, f=None):
+        self.model = m
+        if f is None:
+            f = self._dc_fields()
+        J_eta = self._getJ_eta(f)
+        eta_deriv = self.etaDeriv
+        if isinstance(eta_deriv, Zero):
+            return Zero()
+        if isinstance(eta_deriv, Identity):
+            return J_eta
+        return (eta_deriv.T @ J_eta.T).T
+
     def Jvec(self, m, v, f=None):
-        return self._scale * super().Jvec(m, v, f)
+        self.model = m
+        eta_deriv_v = self.etaDeriv @ v
+        if isinstance(eta_deriv_v, Zero):
+            return np.zeros(self.survey.nD)
+        if f is None:
+            f = self._dc_fields()
+        return self._scale * self._Jvec_eta(eta_deriv_v, f)
 
     def forward(self, m, f=None):
-        return np.asarray(self.Jvec(m, m, f=f))
+        self.model = m
+        if f is None:
+            f = self._dc_fields()
+        eta = self.eta * np.ones(self.mesh.n_cells)
+        return self._scale * self._Jvec_eta(eta, f)
 
     def Jtvec(self, m, v, f=None):
-        return super().Jtvec(m, v * self._scale, f)
+        self.model = m
+        eta_deriv = self.etaDeriv
+        if isinstance(eta_deriv, Zero):
+            return Zero()
+        if f is None:
+            f = self._dc_fields()
+        return eta_deriv.T @ self._Jtvec_eta(v * self._scale, f)
 
     @property
     def _delete_on_model_update(self):

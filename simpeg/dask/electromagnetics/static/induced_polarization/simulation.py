@@ -3,6 +3,29 @@ import dask.array as da
 from .....electromagnetics.static.induced_polarization.simulation import (
     BaseIPSimulation as Sim,
 )
+from .....utils import Identity, Zero
+
+
+def dask_getJ(self, m, f=None):
+    """
+    Generate Full sensitivity matrix
+    """
+    self.model = m
+    if f is None:
+        f = self._dc_fields()
+    J_eta = self._getJ_eta(f)
+    eta_deriv = self.etaDeriv
+    if isinstance(eta_deriv, Zero):
+        return Zero()
+    if isinstance(eta_deriv, Identity):
+        return J_eta
+    if isinstance(J_eta, da.Array):
+        # keeps J lazy, ``J_eta @ eta_deriv`` isn't supported for sparse matrices
+        return J_eta.dot(eta_deriv)
+    return (eta_deriv.T @ J_eta.T).T
+
+
+Sim.getJ = dask_getJ
 
 
 def dask_getJtJdiag(self, m, W=None, f=None):

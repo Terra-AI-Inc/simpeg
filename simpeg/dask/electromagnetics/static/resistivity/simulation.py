@@ -36,7 +36,7 @@ def dask_getJ(self, m, f=None):
         while os.path.exists(self.sensitivity_path):
             pass
 
-    m_size = self.model.size
+    m_size = self._n_sensitivity_params
     count = 0
     for source in self.survey.source_list:
         u_source = f[source, self._solutionType]
